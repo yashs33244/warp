@@ -25,7 +25,7 @@ There is no tmux control-mode rendering path. Running `tmux -CC` in Warp emits r
 
 ## Proposed changes
 
-New module `app/src/terminal/tmux_tty/`, mirroring `remote_tty/`, plus small hooks in the tab/pane/input layers. Feature-flagged behind `tmux_control_mode` (default off during rollout).
+Two layers. The **pure protocol core** (octal escaping, layout parse/emit, `%`-notification parsing + `%begin/%end` reply assembly, and command serialization — no app dependencies) lives in `crates/warp_terminal/src/tmux/`, where it is unit-tested in isolation. The **app-integration layer** (`TmuxTerminalManager`, the fan-out event loop, controller, window opener, and UI hooks) lives in a new `app/src/terminal/tmux_tty/` module (mirroring `remote_tty/`) that consumes `warp_terminal::tmux`. Everything is feature-flagged behind `tmux_control_mode` (default off during rollout).
 
 ### 1. `gateway.rs` — streaming, byte-oriented `TmuxGateway`
 Tokenize and un-escape on `&[u8]` (never `String`: `%output` carries raw non-UTF-8; only bytes `<0x20` and `\` are octal-escaped). Parse `%begin/%end/%error` (correlate replies to commands by number), `%output`, `%extended-output`, `%pause`/`%continue`, `%window-*`, `%layout-change`, `%session-*`, `%pane-mode-changed`, `%exit`. All writes to the control fd go through one serializer that **rejects bare/empty lines** (a bare newline detaches the session) and coalesces input.
@@ -80,7 +80,7 @@ One global order: never acquire a `TerminalModel` lock while holding a `PaneGrou
 
 ## Testing and validation
 
-- **Unit:** gateway framing/escaping incl. a lone `0x80`–`0xFF` byte in `%output`; a proof that no input sequence yields a bare newline on the control fd; layout parse+emit incl. `64d9,204x53,0,0{102x53,0,0,1,101x53,103,0[101x26,103,0,2,101x26,103,27,3]}`; query-response routing; unknown-pane buffering; self-echo idempotency.
+- **Unit:** gateway framing/escaping incl. a lone `0x80`–`0xFF` byte in `%output`; a proof that no input sequence yields a bare newline on the control fd; layout parse+emit incl. `e123,204x53,0,0{102x53,0,0,1,101x53,103,0[101x26,103,0,2,101x26,103,27,3]}`; query-response routing; unknown-pane buffering; self-echo idempotency.
 - **Fixture/transcript tests (CI-safe, no live tmux):** replay recorded `%`-streams through gateway+controller and assert the tab/split tree, pane contents, and the seed↔live-`%output` boundary (no duplicate/missing line). Mirrors `app/src/terminal/ref_tests/data/tmux_htop`. CI has no `tmux` binary, so these are the primary protocol tests.
 - **Integration (`crates/integration/`, gated on tmux ≥3.2):** drive real `tmux -CC`; assert attach, `%layout-change` splits, write-back round-trips, reattach with a running TUI (repaint, no garble), flood-without-freeze, `%exit` teardown. Skips cleanly where tmux is absent.
 - **CI:** `./script/presubmit` (fmt + clippy `-D warnings` + nextest) green; `CHANGELOG-NEW-FEATURE` line; screen-recording proof.
