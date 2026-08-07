@@ -300,7 +300,7 @@ use crate::pane_group::{
     self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
     CustomRouterEditorPane, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
     ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions, PaneGroup, PaneId, PanesLayout,
-    TabBarHoverIndex, TerminalPaneId,
+    TabBarHoverIndex, TerminalPaneId, TerminalViewResources,
 };
 use crate::persistence::ModelEvent;
 use crate::projects::ProjectManagementModel;
@@ -415,6 +415,9 @@ use crate::terminal::session_settings::{
 use crate::terminal::settings::{SpacingMode, TerminalSettings};
 use crate::terminal::shared_session::SharedSessionActionSource;
 use crate::terminal::shell::ShellType;
+use crate::terminal::tmux_tty::layout_map;
+use crate::terminal::tmux_tty::session::TmuxPaneSink;
+use crate::terminal::tmux_tty::terminal_manager::{AdoptedTmuxPane, TmuxTerminalManager};
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::terminal::view::ambient_agent::AmbientAgentViewModel as HandoffAmbientAgentViewModel;
 use crate::terminal::view::ambient_agent::{AuthSecretFtuxView, AuthSecretFtuxViewEvent};
@@ -12887,6 +12890,58 @@ impl Workspace {
                 pg.set_left_panel_open(true, ctx);
             });
         }
+    }
+
+    /// Create a tab that adopts a tmux control-mode window's panes.
+    ///
+    /// One [`TmuxTerminalManager`] is built per tmux pane, arranged into the
+    /// window's split layout, and adopted into a new tab (no shell PTY is
+    /// spawned — the panes render from the tmux control stream). Returns the
+    /// per-pane [`TmuxPaneSink`]s so the caller can route each pane's `%output`
+    /// into its model.
+    pub(crate) fn adopt_tmux_window(
+        &mut self,
+        window: u32,
+        layout: &warp_terminal::tmux::layout::Window,
+        _input_tx: &async_channel::Sender<Vec<u8>>,
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<(u32, TmuxPaneSink)> {
+        let resources = TerminalViewResources {
+            tips_completed: self.tips_completed.clone(),
+            server_api: self.server_api.clone(),
+            model_event_sender: self.model_event_sender.clone(),
+        };
+        let window_id = ctx.window_id();
+        // Seed every adopted pane with a nominal size; tmux re-lays the panes to
+        // the real client size on the first `refresh-client`.
+        // TODO(PR5-resize): drive per-pane sizing from the tmux layout geometry.
+        let initial_size = vec2f(1024.0, 768.0);
+
+        let mut sinks = Vec::new();
+        let tree = layout_map::map_window_to(layout, &mut |pane| {
+            let init =
+                TmuxTerminalManager::create_model(resources.clone(), initial_size, window_id, ctx);
+            sinks.push((pane, TmuxPaneSink::new(init.model, init.events)));
+            // TODO(PR5-input): wire `TmuxInputSender::new(pane, _input_tx.clone())`
+            // as this pane's `EventLoopSender` (via `init_pty_controller_model` +
+            // `wire_up_pty_controller_with_surface`) so keystrokes reach tmux. The
+            // tmux manager mirrors `MockTerminalManager`, which has no
+            // `PtyController`, so this is new plumbing deferred to PR5.
+            AdoptedTmuxPane {
+                uuid: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                manager: init.manager,
+                view: init.view,
+            }
+        });
+
+        self.add_tab_with_pane_layout(
+            PanesLayout::AdoptedTmux(Box::new(tree)),
+            Arc::new(HashMap::new()),
+            Some(format!("tmux @{window}")),
+            ctx,
+        );
+
+        sinks
     }
 
     pub fn add_tab_from_existing_pane(

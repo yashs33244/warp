@@ -141,6 +141,8 @@ use crate::terminal::shared_session::share_modal::{ShareSessionModal, ShareSessi
 use crate::terminal::shared_session::{
     self, IsSharedSessionCreator, SharedSessionActionSource, SharedSessionSource,
 };
+use crate::terminal::tmux_tty::layout_map::TmuxPaneTree;
+use crate::terminal::tmux_tty::terminal_manager::AdoptedTmuxPane;
 use crate::terminal::view::inline_banner::{
     ZeroStatePromptSuggestionTriggeredFrom, ZeroStatePromptSuggestionType,
 };
@@ -865,6 +867,11 @@ pub enum PanesLayout {
     Snapshot(Box<PaneNodeSnapshot>),
     Template(PaneTemplateType),
     AmbientAgent,
+    /// Adopt a tmux control-mode window's already-built panes (one
+    /// manager+view per leaf) into a tab, preserving the tmux split layout.
+    /// Unlike [`Self::Snapshot`], no shell PTY is spawned per leaf: the panes
+    /// are driven by the tmux control stream.
+    AdoptedTmux(Box<TmuxPaneTree<AdoptedTmuxPane>>),
 }
 
 impl Default for PanesLayout {
@@ -1568,6 +1575,59 @@ impl PaneGroup {
 
                 let axis = pane.direction;
                 Ok((PaneData::new_branch(axis.into(), nodes, len), focus))
+            }
+        }
+    }
+
+    /// Builds a pane tree from a tmux window's pre-built panes, adopting each
+    /// manager+view into a [`TerminalPane`] leaf (the tmux analogue of
+    /// [`Self::restore_pane_tree`], but with no shell PTY spawned since the
+    /// panes are driven by the tmux control stream). `focus_leftmost` focuses
+    /// and activates the left-most pane of the whole tree, matching the
+    /// template and restore paths.
+    fn adopt_tmux_pane_tree(
+        tree: TmuxPaneTree<AdoptedTmuxPane>,
+        focus_leftmost: bool,
+        pane_contents: &mut HashMap<PaneId, Box<dyn AnyPaneContent>>,
+        model_event_sender: Option<SyncSender<ModelEvent>>,
+        ctx: &mut ViewContext<PaneGroup>,
+    ) -> (PaneData, InitialFocus) {
+        match tree {
+            TmuxPaneTree::Leaf(pane) => {
+                let terminal_pane =
+                    TerminalPane::new(pane.uuid, pane.manager, pane.view, model_event_sender, ctx);
+                let terminal_pane_id = terminal_pane.terminal_pane_id();
+                let pane_id: PaneId = terminal_pane_id.into();
+                pane_contents.insert(pane_id, Box::new(terminal_pane));
+
+                let focus = InitialFocus {
+                    focused_pane: focus_leftmost.then_some(pane_id),
+                    active_session: focus_leftmost.then_some(terminal_pane_id),
+                };
+                (PaneData::new(pane_id), focus)
+            }
+            TmuxPaneTree::Branch {
+                direction,
+                children,
+            } => {
+                let mut len = 0;
+                let mut nodes = Vec::new();
+                let mut focus = InitialFocus::default();
+
+                for (idx, (flex, child)) in children.into_iter().enumerate() {
+                    let (child_data, child_focus) = Self::adopt_tmux_pane_tree(
+                        child,
+                        focus_leftmost && idx == 0,
+                        pane_contents,
+                        model_event_sender.clone(),
+                        ctx,
+                    );
+                    len += child_data.len();
+                    nodes.push((flex.into(), child_data.root));
+                    focus.merge(child_focus);
+                }
+
+                (PaneData::new_branch(direction.into(), nodes, len), focus)
             }
         }
     }
@@ -3467,6 +3527,13 @@ impl PaneGroup {
                     model_event_sender_clone,
                     pane_contents,
                     pane_history,
+                    ctx,
+                ),
+                PanesLayout::AdoptedTmux(tree) => Self::adopt_tmux_pane_tree(
+                    *tree,
+                    true, // focus + activate the left-most adopted pane
+                    pane_contents,
+                    model_event_sender_clone,
                     ctx,
                 ),
             }

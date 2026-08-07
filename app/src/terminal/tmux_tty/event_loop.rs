@@ -2,47 +2,95 @@
 //!
 //! Modeled on `remote_tty::event_loop`: one connection (here the read half of
 //! the `tmux -CC` process's stdio, delivered as byte chunks over a channel)
-//! feeds a set of terminal models through a session.
+//! feeds a set of terminal models through a session. Lifecycle decisions the
+//! session emits are applied to the [`Workspace`] this loop was started for.
 
-use async_channel::Receiver;
-use warpui::{Entity, ModelContext};
+use std::collections::HashSet;
+
+use async_channel::{Receiver, Sender};
+use warpui::{Entity, ModelContext, WeakViewHandle};
 
 use super::session::{LifecycleEffect, TmuxSession};
+use crate::workspace::Workspace;
 
-/// Owns the [`TmuxSession`] and feeds it bytes read from the control stream.
+/// Owns the [`TmuxSession`] and feeds it bytes read from the control stream,
+/// applying the lifecycle effects it emits to the owning [`Workspace`].
 pub struct TmuxEventLoop {
     session: TmuxSession,
+    /// The workspace whose tabs mirror this tmux session's windows.
+    workspace: WeakViewHandle<Workspace>,
+    /// Write half of the control stream, handed to each adopted pane so its
+    /// keystrokes can be sent back to tmux.
+    input_tx: Sender<Vec<u8>>,
+    /// tmux windows already adopted into a tab. The first `%layout-change` for
+    /// a window builds its tab; later changes are diffed (PR5).
+    adopted_windows: HashSet<u32>,
 }
 
 impl TmuxEventLoop {
     /// Start draining `control_rx` (chunks read from the control fd) into
-    /// `session`. Panes should be registered on `session` before/as they are
-    /// created; unknown-pane `%output` is dropped by the session.
+    /// `session`, applying the resulting lifecycle effects to `workspace`.
+    /// Unknown-pane `%output` is dropped by the session until its pane is
+    /// registered during adoption.
     pub fn start(
         session: TmuxSession,
         control_rx: Receiver<Vec<u8>>,
+        input_tx: Sender<Vec<u8>>,
+        workspace: WeakViewHandle<Workspace>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         ctx.spawn_stream_local(control_rx, Self::on_control_bytes, |_, _| {});
-        Self { session }
-    }
-
-    fn on_control_bytes(&mut self, bytes: Vec<u8>, _ctx: &mut ModelContext<Self>) {
-        for effect in self.session.feed_control_bytes(&bytes) {
-            apply_effect(effect);
+        Self {
+            session,
+            workspace,
+            input_tx,
+            adopted_windows: HashSet::new(),
         }
     }
-}
 
-/// Apply one lifecycle decision to the workspace.
-///
-/// TODO(PR4-ui): actually mutate the UI here — add/remove/rename tabs, recompute
-/// a window's split tree, create a `TmuxTerminalManager` for each added pane,
-/// and tear down on exit. That needs an `AppContext`/`WorkspaceView` the event
-/// loop does not yet hold; until then the decisions are computed and logged so
-/// the pure lifecycle path stays exercised end to end.
-fn apply_effect(effect: LifecycleEffect) {
-    log::debug!("tmux control-mode lifecycle effect (PR4 will apply): {effect:?}");
+    fn on_control_bytes(&mut self, bytes: Vec<u8>, ctx: &mut ModelContext<Self>) {
+        for effect in self.session.feed_control_bytes(&bytes) {
+            self.apply_effect(effect, ctx);
+        }
+    }
+
+    /// Apply one lifecycle decision to the workspace.
+    fn apply_effect(&mut self, effect: LifecycleEffect, ctx: &mut ModelContext<Self>) {
+        match effect {
+            LifecycleEffect::WindowLayout { window, layout, .. } => {
+                if !self.adopted_windows.insert(window) {
+                    // TODO(PR5-incremental): apply the layout `delta` to the
+                    // existing tab (split in `added` panes, tear down
+                    // `removed`). For now only the first layout per window
+                    // builds a tab.
+                    return;
+                }
+                let Some(workspace) = self.workspace.upgrade(ctx) else {
+                    return;
+                };
+                let input_tx = self.input_tx.clone();
+                let sinks = workspace.update(ctx, |workspace, ctx| {
+                    workspace.adopt_tmux_window(window, &layout, &input_tx, ctx)
+                });
+                for (pane, sink) in sinks {
+                    self.session.register_pane(pane, sink);
+                }
+            }
+            LifecycleEffect::WindowClosed { window } => {
+                self.adopted_windows.remove(&window);
+                // TODO(PR5-teardown): remove the adopted tab for this window.
+            }
+            LifecycleEffect::WindowAdded { .. } | LifecycleEffect::WindowRenamed { .. } => {
+                // TODO(PR5-ui): add / rename the tab for this window. A window
+                // becomes visible once its first `%layout-change` arrives.
+            }
+            LifecycleEffect::Exit { .. } => {
+                self.adopted_windows.clear();
+                // TODO(PR5-teardown): close the adopted tmux tabs and drop this
+                // event loop so the control process is reaped.
+            }
+        }
+    }
 }
 
 impl Entity for TmuxEventLoop {

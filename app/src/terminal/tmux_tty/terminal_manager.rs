@@ -36,6 +36,18 @@ pub struct TmuxTerminalManagerInit {
     pub events: ChannelEventListener,
 }
 
+/// A tmux pane's already-built manager+view, ready to be adopted into a Warp tab
+/// leaf without spawning a fresh shell PTY. Carried in
+/// [`crate::pane_group::PanesLayout::AdoptedTmux`] and turned into a
+/// `TerminalPane` by the pane group's adoption path.
+#[derive(Debug)]
+pub struct AdoptedTmuxPane {
+    /// Fresh per-pane session UUID (tmux panes carry no persisted Warp uuid).
+    pub uuid: Vec<u8>,
+    pub manager: ModelHandle<Box<dyn TerminalManager>>,
+    pub view: ViewHandle<TerminalView>,
+}
+
 impl TmuxTerminalManager {
     pub fn create_model(
         resources: TerminalViewResources,
