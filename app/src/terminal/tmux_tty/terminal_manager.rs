@@ -1,0 +1,137 @@
+//! A [`TerminalManager`] backing a single tmux pane's [`TerminalModel`].
+
+use std::any::Any;
+use std::sync::Arc;
+
+use parking_lot::FairMutex;
+use pathfinder_geometry::vector::Vector2F;
+use warpui::{AppContext, ModelHandle, ViewHandle, WindowId};
+
+use crate::context_chips::prompt_type::PromptType;
+use crate::pane_group::TerminalViewResources;
+use crate::terminal::event_listener::ChannelEventListener;
+use crate::terminal::model::session::Sessions;
+use crate::terminal::model_events::ModelEventDispatcher;
+use crate::terminal::shell::{ShellName, ShellType};
+use crate::terminal::terminal_manager::BlockSpacing;
+use crate::terminal::{
+    ShellLaunchState, TerminalManager, TerminalModel, TerminalView, terminal_manager,
+};
+
+/// Owns the [`TerminalModel`] that renders one tmux pane. Modeled on
+/// `MockTerminalManager`: a model + view with no local PTY, since the pane's
+/// bytes arrive over the tmux control stream rather than a child process.
+pub struct TmuxTerminalManager {
+    model: Arc<FairMutex<TerminalModel>>,
+    _view: ViewHandle<TerminalView>,
+}
+
+/// The pieces produced when creating a tmux pane manager. `model` and `events`
+/// let the caller build a [`super::session::TmuxPaneSink`] that writes control
+/// output into this pane.
+pub struct TmuxTerminalManagerInit {
+    pub manager: ModelHandle<Box<dyn TerminalManager>>,
+    pub view: ViewHandle<TerminalView>,
+    pub model: Arc<FairMutex<TerminalModel>>,
+    pub events: ChannelEventListener,
+}
+
+impl TmuxTerminalManager {
+    pub fn create_model(
+        resources: TerminalViewResources,
+        initial_size: Vector2F,
+        window_id: WindowId,
+        ctx: &mut AppContext,
+    ) -> TmuxTerminalManagerInit {
+        let (wakeups_tx, wakeups_rx) = async_channel::unbounded();
+        let (events_tx, events_rx) = async_channel::unbounded();
+        let (pty_reads_tx, _pty_reads_rx) = async_broadcast::broadcast(1);
+        let (executor_command_tx, _executor_command_rx) = async_channel::unbounded();
+
+        let channel_event_proxy = ChannelEventListener::new(wakeups_tx, events_tx, pty_reads_tx);
+
+        let model = terminal_manager::create_terminal_model(
+            None, /* startup_directory */
+            None, /* restored_blocks */
+            initial_size,
+            channel_event_proxy.clone(),
+            ShellLaunchState::ShellSpawned {
+                available_shell: None,
+                display_name: ShellName::blank(),
+                shell_type: ShellType::Zsh,
+            },
+            BlockSpacing::for_gui(ctx),
+            ctx,
+        );
+        let colors = model.colors();
+        let model = Arc::new(FairMutex::new(model));
+
+        let sessions: ModelHandle<Sessions> =
+            ctx.add_model(|ctx| Sessions::new(executor_command_tx, ctx));
+        let model_events_dispatcher =
+            ctx.add_model(|ctx| ModelEventDispatcher::new(events_rx, sessions.clone(), ctx));
+
+        let cloned_model = model.clone();
+        let prompt_type =
+            ctx.add_model(|ctx| PromptType::new_dynamic_from_sessions(sessions.clone(), ctx));
+        let view = ctx.add_typed_action_view(window_id, |ctx| {
+            let size_info = cloned_model.lock().block_list().size().to_owned();
+            TerminalView::new(
+                resources,
+                wakeups_rx,
+                model_events_dispatcher.clone(),
+                cloned_model,
+                sessions.clone(),
+                size_info,
+                colors,
+                None,
+                prompt_type,
+                None,
+                None, // conversation_restoration
+                None, // inactive_pty_reads_rx
+                false,
+                ctx,
+            )
+        });
+
+        // Retain the model-events dispatcher for the life of the view (same
+        // trick as `MockTerminalManager`): give ownership to a closure held by
+        // a task that never completes.
+        view.update(ctx, |_view, ctx| {
+            ctx.spawn(futures::future::pending::<()>(), move |_, _, _| {
+                std::mem::drop(model_events_dispatcher);
+            });
+        });
+
+        let terminal_view = view.clone();
+        let manager = Self {
+            model: model.clone(),
+            _view: view,
+        };
+        let manager_model = ctx.add_model(|_ctx| {
+            let manager: Box<dyn TerminalManager> = Box::new(manager);
+            manager
+        });
+
+        TmuxTerminalManagerInit {
+            manager: manager_model,
+            view: terminal_view,
+            model,
+            events: channel_event_proxy,
+        }
+    }
+}
+
+impl TerminalManager for TmuxTerminalManager {
+    fn model(&self) -> Arc<FairMutex<TerminalModel>> {
+        self.model.clone()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
