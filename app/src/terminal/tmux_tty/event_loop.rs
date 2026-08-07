@@ -7,7 +7,7 @@
 use async_channel::Receiver;
 use warpui::{Entity, ModelContext};
 
-use super::session::TmuxSession;
+use super::session::{LifecycleEffect, TmuxSession};
 
 /// Owns the [`TmuxSession`] and feeds it bytes read from the control stream.
 pub struct TmuxEventLoop {
@@ -28,8 +28,21 @@ impl TmuxEventLoop {
     }
 
     fn on_control_bytes(&mut self, bytes: Vec<u8>, _ctx: &mut ModelContext<Self>) {
-        self.session.feed_control_bytes(&bytes);
+        for effect in self.session.feed_control_bytes(&bytes) {
+            apply_effect(effect);
+        }
     }
+}
+
+/// Apply one lifecycle decision to the workspace.
+///
+/// TODO(PR4-ui): actually mutate the UI here — add/remove/rename tabs, recompute
+/// a window's split tree, create a `TmuxTerminalManager` for each added pane,
+/// and tear down on exit. That needs an `AppContext`/`WorkspaceView` the event
+/// loop does not yet hold; until then the decisions are computed and logged so
+/// the pure lifecycle path stays exercised end to end.
+fn apply_effect(effect: LifecycleEffect) {
+    log::debug!("tmux control-mode lifecycle effect (PR4 will apply): {effect:?}");
 }
 
 impl Entity for TmuxEventLoop {
