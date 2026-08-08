@@ -3220,7 +3220,19 @@ impl ansi::Handler for TerminalModel {
                 let was_triggered_by_rc_file_snippet =
                     self.did_receive_rc_file_dcs.take().unwrap_or(false);
                 let env_var_collection_name = self.env_var_collection_name.take();
-                let spawning_command = self.block_list().active_block().command_to_string();
+                // Warpifying an adopted (still-raw) tmux pane is Warp's own
+                // bootstrap handshake - it sources an internal temp file - not a
+                // user-run subshell. Recording that " source '<tmp>'" as the
+                // spawning command would draw a spurious "source" subshell
+                // separator/flag above the input; a normal Warp pane shows none,
+                // so record an empty command here to match it. A genuine subshell
+                // the user later starts inside the warpified pane (e.g. ssh) is
+                // no longer raw, so it still records and decorates normally.
+                let spawning_command = if self.is_raw_adopted_pane() {
+                    String::new()
+                } else {
+                    self.block_list().active_block().command_to_string()
+                };
 
                 let ssh_connection_info =
                     ssh::util::parse_interactive_ssh_command(&spawning_command);
