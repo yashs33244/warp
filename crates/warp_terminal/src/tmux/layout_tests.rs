@@ -5,11 +5,9 @@ fn leaf(pane: u32, w: u32, h: u32, x: u32, y: u32) -> LayoutNode {
 }
 
 // NOTE: the checksum prefixes below (e123 / ee3e / 419a) are the values
-// the specified algorithm actually produces for these exact bodies, and
-// they match real tmux 3.5a byte-for-byte (verified by dumping a live
-// session's #{window_layout}). The task prompt's stated prefixes
-// (64d9 / ce55 / bc62) are inconsistent with the algorithm it also
-// specifies; matching real tmux is the correct behavior for interop.
+// `checksum()` actually produces for these exact bodies, and they match real
+// tmux 3.5a byte-for-byte (verified by dumping a live session's
+// #{window_layout}). Matching real tmux is the correct behavior for interop.
 const V1: &str = "e123,204x53,0,0{102x53,0,0,1,101x53,103,0[101x26,103,0,2,101x26,103,27,3]}";
 const V2: &str = "ee3e,204x53,0,0{102x53,0,0,1,101x53,103,0,2}";
 const V3: &str = "419a,80x24,0,0[80x12,0,0,1,80x11,0,13,2]";
@@ -412,4 +410,23 @@ fn checksum_mismatch_error_details() {
         }
         other => panic!("expected ChecksumMismatch, got {other:?}"),
     }
+}
+
+#[test]
+fn deeply_nested_layout_is_rejected_not_overflowing() {
+    // A pathologically deep string must return an error instead of recursing
+    // until the stack overflows. Build a body far past MAX_LAYOUT_DEPTH, prefix
+    // it with its real checksum so it reaches the recursive parser, and assert
+    // it errors rather than panics.
+    let depth = 5_000;
+    let mut body = String::new();
+    for _ in 0..depth {
+        body.push_str("80x24,0,0[");
+    }
+    body.push_str("80x24,0,0,1");
+    for _ in 0..depth {
+        body.push(']');
+    }
+    let s = format!("{:04x},{body}", checksum(&body));
+    assert!(matches!(parse_layout(&s), Err(LayoutError::Malformed)));
 }

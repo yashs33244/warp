@@ -30,6 +30,17 @@ fn write_command_rejects_empty() {
 }
 
 #[test]
+fn write_command_rejects_embedded_control() {
+    // An embedded newline/CR would smuggle a second command past the
+    // one-command-per-line framing; other control bytes are refused too.
+    assert_eq!(write_command("kill-server\ndetach"), Err(CommandError));
+    assert_eq!(write_command("a\rb"), Err(CommandError));
+    assert_eq!(write_command("a\tb"), Err(CommandError));
+    // Surrounding whitespace is still trimmed rather than rejected.
+    assert_eq!(write_command("\tfoo\n").unwrap(), b"foo\n");
+}
+
+#[test]
 fn send_keys_hex_rejects_empty() {
     assert_eq!(send_keys_hex(0, &[]), Err(CommandError));
     assert_eq!(send_keys_hex(42, b""), Err(CommandError));

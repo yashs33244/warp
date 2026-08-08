@@ -18,11 +18,18 @@ impl std::fmt::Display for CommandError {
 impl std::error::Error for CommandError {}
 
 /// Serialize a single command line. Trims the input; a command that is empty
-/// after trimming is rejected. The returned buffer is the trimmed command
-/// bytes followed by exactly one `b"\n"`.
+/// after trimming, or that contains any embedded ASCII control byte, is
+/// rejected. Control bytes are refused because a command must occupy exactly
+/// one line: an embedded `\n`/`\r` would smuggle a second command onto the
+/// control stream (and a bare newline detaches the session), so the
+/// one-command-per-line framing must never carry one. The returned buffer is
+/// the trimmed command bytes followed by exactly one `b"\n"`.
 pub fn write_command(cmd: &str) -> Result<Vec<u8>, CommandError> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
+        return Err(CommandError);
+    }
+    if trimmed.bytes().any(|b| b.is_ascii_control()) {
         return Err(CommandError);
     }
     let mut out = Vec::with_capacity(trimmed.len() + 1);

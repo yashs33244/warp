@@ -118,6 +118,7 @@ pub fn parse_layout(s: &str) -> Result<Window, LayoutError> {
     let mut p = Parser {
         b: body.as_bytes(),
         i: 0,
+        depth: 0,
     };
     let root = p.parse_cell()?;
     if p.i != p.b.len() {
@@ -129,9 +130,16 @@ pub fn parse_layout(s: &str) -> Result<Window, LayoutError> {
     })
 }
 
+/// Cap on how deeply a layout string may nest. Real tmux layouts nest only a
+/// handful of levels; this bounds `parse_cell`/`parse_children` recursion so a
+/// pathological (adversarial) string returns `Malformed` instead of overflowing
+/// the stack and aborting the process.
+const MAX_LAYOUT_DEPTH: usize = 128;
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -171,6 +179,20 @@ impl Parser<'_> {
     }
 
     fn parse_cell(&mut self) -> Result<LayoutNode, LayoutError> {
+        // Bound recursion depth: `parse_cell` -> `parse_children` -> `parse_cell`
+        // could otherwise overflow the stack on a deeply nested string. Depth is
+        // decremented on the way out so sibling cells (a flat list) don't count
+        // toward it - only nesting does.
+        self.depth += 1;
+        if self.depth > MAX_LAYOUT_DEPTH {
+            return Err(LayoutError::Malformed);
+        }
+        let node = self.parse_cell_inner();
+        self.depth -= 1;
+        node
+    }
+
+    fn parse_cell_inner(&mut self) -> Result<LayoutNode, LayoutError> {
         let w = self.parse_u32()?;
         self.expect(b'x')?;
         let h = self.parse_u32()?;
