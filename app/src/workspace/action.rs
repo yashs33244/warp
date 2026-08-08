@@ -892,6 +892,7 @@ pub enum WorkspaceAction {
     /// actual attach is deferred to a global action so it runs after the
     /// workspace view update completes.
     AttachTmuxControlMode,
+    ManageTmuxSessions,
 }
 
 impl From<&WorkspaceAction> for LoginGatedFeature {
@@ -1216,7 +1217,8 @@ impl WorkspaceAction {
             | OpenNetworkLogPane
             | OpenNewWindowForTeam { .. }
             | ShowTeamSwitcherMenu
-            | AttachTmuxControlMode => false,
+            | AttachTmuxControlMode
+            | ManageTmuxSessions => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

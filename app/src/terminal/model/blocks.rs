@@ -849,6 +849,37 @@ impl BlockList {
         self.bootstrap_stage = BootstrapStage::WarpInput;
     }
 
+    /// Simulate a finished bootstrap for a pane adopted from a shell Warp did
+    /// not spawn, i.e. a tmux control-mode pane.
+    ///
+    /// A block list starts at [`BootstrapStage::WarpInput`] and only advances
+    /// when Warp's own shell integration reports back. The plain shell running
+    /// inside a tmux pane never does that, so without this the pane would stay
+    /// un-bootstrapped forever: input is rejected as `NotBootstrapped`, the
+    /// prompt reads "Starting shell...", and output parses into the bootstrap
+    /// block, which is hidden — the pane renders blank.
+    /// [`Self::load_shared_session_scrollback`] simulates bootstrap for the
+    /// same reason; an adopted pane differs only in having no serialized
+    /// blocks to restore, so it just needs one visible block to stream into.
+    pub fn simulate_bootstrap_for_adopted_pane(&mut self) {
+        if !self.active_block().finished() {
+            self.active_block_mut().finish(0);
+            self.update_active_block_height();
+        }
+        // `PostBootstrapPrecmd` rather than `Bootstrapped`: the precmd that
+        // would normally advance the stage comes from Warp's hooks, which never
+        // run in an adopted shell.
+        self.bootstrap_stage = BootstrapStage::PostBootstrapPrecmd;
+        self.create_new_block(
+            BlockId::new(),
+            BootstrapStage::PostBootstrapPrecmd,
+            None,
+            None,
+        );
+        self.start_active_block();
+        self.update_active_block_height();
+    }
+
     pub fn restored_session_ts(&self) -> &Option<DateTime<Local>> {
         &self.restored_session_ts
     }

@@ -110,9 +110,17 @@ impl TerminalView {
 
     pub fn refresh_pane_header(&mut self, ctx: &mut ViewContext<Self>) {
         let is_active_session = self.is_active_session(ctx);
+        // Adopted (tmux) panes only: tmux has its own notion of an active pane,
+        // so the accent border is what tells the user which one that is. Other
+        // panes are left alone, since shared sessions drive the same flag.
+        let is_adopted_pane = self.model.lock().is_adopted_pane();
+        let show_accent_border = is_adopted_pane.then(|| self.is_pane_focused(ctx));
         self.pane_configuration
             .update(ctx, move |pane_config, ctx| {
                 pane_config.set_show_active_pane_indicator(is_active_session, ctx);
+                if let Some(show_accent_border) = show_accent_border {
+                    pane_config.set_show_accent_border(show_accent_border, ctx);
+                }
                 pane_config.refresh_pane_header_overflow_menu_items(ctx);
             });
     }

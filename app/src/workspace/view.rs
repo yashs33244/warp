@@ -101,7 +101,7 @@ use warpui::elements::{
 use warpui::fonts::{Properties, Weight};
 use warpui::geometry::vector::{Vector2F, vec2f};
 use warpui::keymap::Context;
-use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
+use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback, ModalButton};
 use warpui::notification::{NotificationSendError, RequestPermissionsOutcome, UserNotification};
 use warpui::platform::{
     Cursor, FilePickerConfiguration, FullscreenState, SystemTheme, TerminationMode,
@@ -415,13 +415,16 @@ use crate::terminal::session_settings::{
 use crate::terminal::settings::{SpacingMode, TerminalSettings};
 use crate::terminal::shared_session::SharedSessionActionSource;
 use crate::terminal::shell::ShellType;
-use crate::terminal::tmux_tty::input::{TmuxInputSender, TmuxResponder};
+use crate::terminal::tmux_tty::geometry::TmuxGeometry;
+use crate::terminal::tmux_tty::input::{TmuxInputSender, TmuxPaneCommands, TmuxResponder};
 use crate::terminal::tmux_tty::layout_map;
+use crate::terminal::tmux_tty::lifecycle::LayoutDelta;
 use crate::terminal::tmux_tty::session::TmuxPaneSink;
 use crate::terminal::tmux_tty::terminal_manager::{AdoptedTmuxPane, TmuxTerminalManager};
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::terminal::view::ambient_agent::AmbientAgentViewModel as HandoffAmbientAgentViewModel;
 use crate::terminal::view::ambient_agent::{AuthSecretFtuxView, AuthSecretFtuxViewEvent};
+use crate::terminal::view::cell_size_and_padding;
 #[cfg(feature = "local_tty")]
 use crate::terminal::view::docker_sandbox::DEFAULT_DOCKER_SANDBOX_BASE_IMAGE;
 use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
@@ -549,6 +552,11 @@ use crate::{
 
 /// The padding that should be applied to the workspace as a whole.
 pub const WORKSPACE_PADDING: f32 = 1.0;
+
+/// Grid a newly split tmux pane is created at when its geometry is missing from
+/// the layout tmux just sent. tmux corrects it with the next `%layout-change`.
+const TMUX_FALLBACK_COLUMNS: u32 = 80;
+const TMUX_FALLBACK_ROWS: u32 = 24;
 
 /// The minimum font size at which terminal text will be rendered.
 const MIN_FONT_SIZE: f32 = 5.0;
@@ -1205,6 +1213,14 @@ pub struct Workspace {
     /// orchestration cards' "New API key…" flow. Cloud mode renders the
     /// FTUX view inline and does not use this.
     create_auth_secret_modal: Option<ViewHandle<Modal<AuthSecretFtuxView>>>,
+    /// tmux control-mode pane id -> the Warp pane adopted for it, so a later
+    /// `%layout-change` can split panes in beside their neighbours and close
+    /// the ones tmux dropped.
+    tmux_panes: HashMap<u32, PaneId>,
+    /// Whether a tmux control session is already mirrored in this workspace.
+    /// Only one is supported at a time: every adopted pane shares `tmux_panes`,
+    /// so a second session's `%exit` would tear down the first's panes.
+    tmux_control_active: bool,
 }
 
 impl Workspace {
@@ -3535,6 +3551,8 @@ impl Workspace {
                 Self::build_remove_tab_config_confirmation_dialog(ctx),
             handoff_environment_creation_modal: None,
             create_auth_secret_modal: None,
+            tmux_panes: HashMap::new(),
+            tmux_control_active: false,
         };
 
         ws.configure_new_workspace(workspace_setting, ctx);
@@ -12261,6 +12279,100 @@ impl Workspace {
         true
     }
 
+    /// Whether the tab at `index` renders panes adopted from tmux.
+    fn tab_holds_tmux_panes(&self, index: usize, ctx: &AppContext) -> bool {
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
+        };
+        let pane_group = tab.pane_group.as_ref(ctx);
+        self.tmux_panes
+            .values()
+            .any(|pane_id| pane_group.has_pane_id(*pane_id))
+    }
+
+    /// Ask whether closing a tmux tab should leave the session running (detach)
+    /// or end it (kill). Closing the tab either way; the difference is what
+    /// happens to the shells inside it.
+    fn confirm_close_tmux_tab(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        let handle = ctx.handle();
+        let detach_handle = handle.clone();
+        let kill_handle = handle;
+        let dialog = AlertDialogWithCallbacks::for_app(
+            "Close this tmux tab?",
+            "Detaching leaves the session and everything running in it alive, so you can attach again later. Killing it ends every shell in the session.",
+            vec![
+                ModalButton::for_app("Detach (keep session running)", move |ctx| {
+                    if let Some(workspace) = detach_handle.upgrade(ctx) {
+                        workspace.update(ctx, |workspace, ctx| {
+                            workspace.finish_closing_tmux_tab(index, false, ctx);
+                        });
+                    }
+                }),
+                ModalButton::for_app("Kill session", move |ctx| {
+                    if let Some(workspace) = kill_handle.upgrade(ctx) {
+                        workspace.update(ctx, |workspace, ctx| {
+                            workspace.finish_closing_tmux_tab(index, true, ctx);
+                        });
+                    }
+                }),
+                ModalButton::for_app("Cancel", |_ctx| {}),
+            ],
+            |_ctx| {},
+        );
+        self.show_native_modal(dialog, ctx);
+    }
+
+    /// Close a tmux tab after the user chose detach or kill.
+    fn finish_closing_tmux_tab(
+        &mut self,
+        index: usize,
+        kill_session: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if kill_session {
+            self.send_to_tmux_panes_in_tab(
+                index,
+                warp_terminal::tmux::command::kill_session(),
+                ctx,
+            );
+        } else {
+            self.send_to_tmux_panes_in_tab(
+                index,
+                warp_terminal::tmux::command::detach_client(),
+                ctx,
+            );
+        }
+        self.close_tab(index, true, true, ctx);
+    }
+
+    /// Send one control command on behalf of any tmux pane in the tab. Every
+    /// pane of a session shares the one control stream, so the first is enough.
+    fn send_to_tmux_panes_in_tab(
+        &mut self,
+        index: usize,
+        command: Vec<u8>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let pane_group = tab.pane_group.clone();
+        let pane_ids: Vec<PaneId> = self
+            .tmux_panes
+            .values()
+            .copied()
+            .filter(|pane_id| pane_group.as_ref(ctx).has_pane_id(*pane_id))
+            .collect();
+        for pane_id in pane_ids {
+            let sent = pane_group.update(ctx, |group, ctx| {
+                group.send_tmux_command_for_pane(pane_id, &command, ctx)
+            });
+            if sent {
+                return;
+            }
+        }
+    }
+
     /// Opens a confirmation dialog if necessary, or closes immediately if not.
     /// Always closes immediately if skip_confirmation is true.
     fn close_tab(
@@ -12272,6 +12384,13 @@ impl Workspace {
     ) {
         let is_last_tab = self.tabs.len() == 1;
         if !ContextFlag::CloseWindow.is_enabled() && is_last_tab {
+            return;
+        }
+
+        // Closing a tmux tab is ambiguous: the session outlives Warp, so ask
+        // whether to leave it running or end it.
+        if !skip_confirmation && self.tab_holds_tmux_panes(index, ctx) {
+            self.confirm_close_tmux_tab(index, ctx);
             return;
         }
 
@@ -12905,40 +13024,29 @@ impl Workspace {
         window: u32,
         layout: &warp_terminal::tmux::layout::Window,
         input_tx: &async_channel::Sender<Vec<u8>>,
+        geometry: &TmuxGeometry,
         ctx: &mut ViewContext<Self>,
     ) -> Vec<(u32, TmuxPaneSink)> {
-        let resources = TerminalViewResources {
-            tips_completed: self.tips_completed.clone(),
-            server_api: self.server_api.clone(),
-            model_event_sender: self.model_event_sender.clone(),
-        };
+        let resources = self.tmux_pane_resources();
         let window_id = ctx.window_id();
-        // Seed every adopted pane with a nominal size; tmux re-lays the panes to
-        // the real client size on the first `refresh-client`.
-        // TODO(PR5-resize): drive per-pane sizing from the tmux layout geometry.
-        let initial_size = vec2f(1024.0, 768.0);
 
         let mut sinks = Vec::new();
-        let tree = layout_map::map_window_to(layout, &mut |pane| {
-            // The pane's keystrokes reach tmux through this sender (wired as the
-            // manager's `EventLoopSender`); its emulator replies go back through
-            // a responder on the sink. Both share the control write channel.
-            let input_sender = TmuxInputSender::new(pane, input_tx.clone());
-            let init = TmuxTerminalManager::create_model(
+        let mut view_ids = Vec::new();
+        let tree = layout_map::map_window_to(layout, &mut |pane, columns, rows| {
+            let (adopted, sink) = Self::create_tmux_pane(
                 resources.clone(),
-                input_sender,
-                initial_size,
+                window,
+                pane,
+                columns,
+                rows,
+                input_tx,
+                geometry,
                 window_id,
                 ctx,
             );
-            let sink = TmuxPaneSink::new(init.model, init.events)
-                .with_responder(TmuxResponder::new(pane, input_tx.clone()));
+            view_ids.push((pane, adopted.view.id()));
             sinks.push((pane, sink));
-            AdoptedTmuxPane {
-                uuid: uuid::Uuid::new_v4().as_bytes().to_vec(),
-                manager: init.manager,
-                view: init.view,
-            }
+            adopted
         });
 
         self.add_tab_with_pane_layout(
@@ -12948,7 +13056,209 @@ impl Workspace {
             ctx,
         );
 
+        // A pane's `PaneId` only exists once the tree above has been adopted
+        // into the new tab, so the tmux id -> pane id map is filled in here.
+        let pane_group = self.active_tab_pane_group().clone();
+        for (pane, view_id) in view_ids {
+            if let Some(pane_id) = pane_group
+                .as_ref(ctx)
+                .find_pane_id_for_terminal_view(view_id, ctx)
+            {
+                self.tmux_panes.insert(pane, pane_id);
+            }
+        }
+
         sinks
+    }
+
+    /// Apply a later tmux layout change to the tab already adopted for a
+    /// window: split in each pane tmux added and close each one it removed.
+    /// Returns the sinks for the panes created here.
+    pub(crate) fn apply_tmux_layout_delta(
+        &mut self,
+        window: u32,
+        layout: &warp_terminal::tmux::layout::Window,
+        delta: &LayoutDelta,
+        input_tx: &async_channel::Sender<Vec<u8>>,
+        geometry: &TmuxGeometry,
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<(u32, TmuxPaneSink)> {
+        let resources = self.tmux_pane_resources();
+        let window_id = ctx.window_id();
+        let mut sinks = Vec::new();
+
+        for &pane in &delta.added {
+            if self.tmux_panes.contains_key(&pane) {
+                continue;
+            }
+            let adopted = &self.tmux_panes;
+            let placement =
+                layout_map::placement_for_pane(layout, pane, &|id| adopted.contains_key(&id));
+            let Some((base, direction)) =
+                placement.and_then(|it| adopted.get(&it.base).map(|id| (*id, it.direction)))
+            else {
+                log::warn!("tmux pane %{pane} has no adopted neighbour to split off");
+                continue;
+            };
+            let Some(pane_group) = self.pane_group_containing(base, ctx) else {
+                continue;
+            };
+            let (columns, rows) = layout_map::pane_grid_size(layout, pane)
+                .unwrap_or((TMUX_FALLBACK_COLUMNS, TMUX_FALLBACK_ROWS));
+            let (adopted_pane, sink) = Self::create_tmux_pane(
+                resources.clone(),
+                window,
+                pane,
+                columns,
+                rows,
+                input_tx,
+                geometry,
+                window_id,
+                ctx,
+            );
+            let new_pane_id = pane_group.update(ctx, |group, ctx| {
+                group.adopt_tmux_pane(base, direction, adopted_pane, ctx)
+            });
+            if let Some(new_pane_id) = new_pane_id {
+                self.tmux_panes.insert(pane, new_pane_id);
+                sinks.push((pane, sink));
+            }
+        }
+
+        for pane in &delta.removed {
+            let Some(pane_id) = self.tmux_panes.remove(pane) else {
+                continue;
+            };
+            if let Some(pane_group) = self.pane_group_containing(pane_id, ctx) {
+                pane_group.update(ctx, |group, ctx| group.close_pane(pane_id, ctx));
+            }
+        }
+
+        sinks
+    }
+
+    fn tmux_pane_resources(&self) -> TerminalViewResources {
+        TerminalViewResources {
+            tips_completed: self.tips_completed.clone(),
+            server_api: self.server_api.clone(),
+            model_event_sender: self.model_event_sender.clone(),
+        }
+    }
+
+    /// Pixel size whose terminal grid is `columns` x `rows` for the current
+    /// monospace font, so an adopted pane can be created at the exact geometry
+    /// tmux reported for it.
+    fn tmux_pixel_size_for_grid(columns: u32, rows: u32, app: &AppContext) -> Vector2F {
+        let appearance = Appearance::as_ref(app);
+        let metrics = cell_size_and_padding(
+            app.font_cache(),
+            appearance.monospace_font_family(),
+            appearance.monospace_font_size(),
+            appearance.ui_builder().line_height_ratio(),
+        );
+        // Half a cell of slack absorbs the truncation when the pixel size is
+        // converted back into a grid, which would otherwise cost a row/column.
+        vec2f(
+            columns as f32 * metrics.cell_width_px.as_f32()
+                + 2. * metrics.padding_x_px.as_f32()
+                + metrics.cell_width_px.as_f32() * 0.5,
+            rows as f32 * metrics.cell_height_px.as_f32()
+                + 2. * metrics.padding_y_px.as_f32()
+                + metrics.cell_height_px.as_f32() * 0.5,
+        )
+    }
+
+    /// Build the manager + view backing one tmux pane, along with the sink that
+    /// feeds the pane's `%output` into it.
+    #[allow(clippy::too_many_arguments)]
+    fn create_tmux_pane(
+        resources: TerminalViewResources,
+        window: u32,
+        pane: u32,
+        columns: u32,
+        rows: u32,
+        input_tx: &async_channel::Sender<Vec<u8>>,
+        geometry: &TmuxGeometry,
+        window_id: WindowId,
+        ctx: &mut ViewContext<Self>,
+    ) -> (AdoptedTmuxPane, TmuxPaneSink) {
+        // Start the pane at the grid tmux laid it out at, so the emulator wraps
+        // exactly where the shell wrote. Sizing it any other way would render
+        // the session's own layout as squeezed or clipped text.
+        let initial_size = Self::tmux_pixel_size_for_grid(columns, rows, ctx);
+        // The pane's keystrokes reach tmux through this sender (wired as the
+        // manager's `EventLoopSender`); its emulator replies go back through a
+        // responder on the sink. Both share the control write channel.
+        let input_sender = TmuxInputSender::new(window, pane, geometry.clone(), input_tx.clone());
+        let init = TmuxTerminalManager::create_model(
+            resources,
+            input_sender,
+            initial_size,
+            window_id,
+            ctx,
+        );
+        let sink = TmuxPaneSink::new(init.model, init.events)
+            .with_responder(TmuxResponder::new(pane, input_tx.clone()));
+        // Lets the pane's context menu drive tmux (split / kill / detach).
+        let commands = TmuxPaneCommands::new(window, pane, input_tx.clone());
+        init.view.update(ctx, |view, ctx| {
+            view.set_tmux_pane_commands(commands, ctx);
+        });
+        (
+            AdoptedTmuxPane {
+                uuid: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                manager: init.manager,
+                view: init.view,
+            },
+            sink,
+        )
+    }
+
+    /// The tab pane group holding `pane_id`, if any.
+    fn pane_group_containing(
+        &self,
+        pane_id: PaneId,
+        ctx: &AppContext,
+    ) -> Option<ViewHandle<PaneGroup>> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.pane_group.as_ref(ctx).has_pane_id(pane_id))
+            .map(|tab| tab.pane_group.clone())
+    }
+
+    /// Re-run the warpify bootstrap for one adopted pane whose shell turned
+    /// out to be zombie-warpified (stale session id) now that it is back at a
+    /// prompt.
+    pub(crate) fn rewarpify_tmux_pane(&mut self, pane: u32, ctx: &mut ViewContext<Self>) {
+        let Some(&pane_id) = self.tmux_panes.get(&pane) else {
+            return;
+        };
+        if let Some(pane_group) = self.pane_group_containing(pane_id, ctx) {
+            pane_group.update(ctx, |group, ctx| group.rewarpify_adopted_pane(pane_id, ctx));
+        }
+    }
+
+    /// Whether a tmux control session is already mirrored here (see the field).
+    pub(crate) fn has_active_tmux_control_session(&self) -> bool {
+        self.tmux_control_active
+    }
+
+    /// Record that a tmux control session is now (or no longer) mirrored here.
+    pub(crate) fn set_tmux_control_active(&mut self, active: bool) {
+        self.tmux_control_active = active;
+    }
+
+    /// Close every pane adopted from the tmux session. Called when the control
+    /// session ends (`%exit`, which a detach also produces): the panes mirror a
+    /// session Warp can no longer reach, so leaving them on screen would show
+    /// output the user can neither drive nor scroll.
+    pub(crate) fn close_all_tmux_panes(&mut self, ctx: &mut ViewContext<Self>) {
+        self.tmux_control_active = false;
+        for (_, pane_id) in std::mem::take(&mut self.tmux_panes) {
+            if let Some(pane_group) = self.pane_group_containing(pane_id, ctx) {
+                pane_group.update(ctx, |group, ctx| group.close_pane(pane_id, ctx));
+            }
+        }
     }
 
     pub fn add_tab_from_existing_pane(
@@ -23990,6 +24300,9 @@ impl TypedActionView for Workspace {
                 // Deferred so the attach runs after this view update completes
                 // (it re-enters the workspace to retain the control loop).
                 ctx.dispatch_global_action("workspace:attach_tmux_control_mode", ());
+            }
+            ManageTmuxSessions => {
+                ctx.dispatch_global_action("workspace:manage_tmux_sessions", ());
             }
             ToggleBlockSnackbar => self.toggle_block_snackbar(ctx),
             ToggleWelcomeTips => self.toggle_welcome_tips_visiblity(ctx),

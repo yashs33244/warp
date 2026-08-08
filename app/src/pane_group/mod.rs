@@ -1632,6 +1632,29 @@ impl PaneGroup {
         }
     }
 
+    /// Splits one already-built tmux pane in beside `base`, for a pane tmux
+    /// added to a window Warp has already adopted. Returns the new pane's id,
+    /// or `None` if the split did not take.
+    pub fn adopt_tmux_pane(
+        &mut self,
+        base: PaneId,
+        direction: Direction,
+        pane: AdoptedTmuxPane,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<PaneId> {
+        let terminal_pane = TerminalPane::new(
+            pane.uuid,
+            pane.manager,
+            pane.view,
+            self.model_event_sender.clone(),
+            ctx,
+        );
+        let pane_id: PaneId = terminal_pane.terminal_pane_id().into();
+        let pane: Box<dyn AnyPaneContent> = Box::new(terminal_pane);
+        self.add_pane_sibling(base, direction, pane, true, ctx);
+        self.has_pane_id(pane_id).then_some(pane_id)
+    }
+
     /// Restores a single leaf pane from a snapshot.
     #[allow(clippy::too_many_arguments)]
     fn restore_pane_leaf(
@@ -2243,6 +2266,30 @@ impl PaneGroup {
                 })
             }
         }
+    }
+
+    /// Send a raw tmux control command on behalf of the adopted pane `pane_id`.
+    /// Returns whether the pane was found and is in fact a tmux pane.
+    pub fn send_tmux_command_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        command: &[u8],
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(terminal_pane) = self.downcast_pane_by_id::<TerminalPane>(pane_id) else {
+            return false;
+        };
+        let view = terminal_pane.terminal_view(ctx).clone();
+        view.update(ctx, |view, _ctx| view.send_tmux_command(command))
+    }
+
+    /// Re-run the warpify bootstrap on an adopted tmux pane's view.
+    pub fn rewarpify_adopted_pane(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        let Some(terminal_pane) = self.downcast_pane_by_id::<TerminalPane>(pane_id) else {
+            return;
+        };
+        let view = terminal_pane.terminal_view(ctx).clone();
+        view.update(ctx, |view, ctx| view.rewarpify_adopted_pane(ctx));
     }
 
     /// Find the PaneId for a given TerminalView EntityId if it exists within this PaneGroup.

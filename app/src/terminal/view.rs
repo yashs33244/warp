@@ -465,6 +465,7 @@ use crate::terminal::shared_session::{
     SharedSessionActionSource, SharedSessionScrollbackType, SharedSessionSource,
     SharedSessionStatus,
 };
+use crate::terminal::tmux_tty::input::TmuxPaneCommands;
 use crate::terminal::view::block_onboarding::onboarding_prompt_block::OnboardingPromptBlock;
 use crate::terminal::view::init_environment::mode_selector::{
     EnvironmentSetupMode, EnvironmentSetupModeSelector, EnvironmentSetupModeSelectorEvent,
@@ -2617,6 +2618,12 @@ pub struct TerminalView {
     osc52_clipboard_banner_suppressed: bool,
 
     pane_configuration: ModelHandle<PaneConfiguration>,
+    /// Set on a pane adopted from a tmux control-mode session; drives the
+    /// pane's tmux context menu (split / kill / detach / rename).
+    tmux: Option<TmuxPaneCommands>,
+    /// Whether this adopted pane's shell has been warpified. Mirrors the model
+    /// flag, kept on the view so menu building never re-locks the model.
+    tmux_warpified: bool,
     focus_handle: Option<PaneFocusHandle>,
 
     sessions: ModelHandle<Sessions>,
@@ -4331,6 +4338,8 @@ impl TerminalView {
             osc52_clipboard_blocked_type: None,
             osc52_clipboard_banner_suppressed,
             pane_configuration,
+            tmux: None,
+            tmux_warpified: false,
             focus_handle: None,
             sessions,
             remote_server_shimmer_handle: ShimmeringTextStateHandle::new(),
@@ -8372,6 +8381,11 @@ impl TerminalView {
         if model.is_read_only() {
             return false;
         }
+        // An adopted (tmux) pane mirrors a shell that runs its own line editor,
+        // so Warp's input box stays hidden until that shell has bootstrapped.
+        if model.is_adopted_pane() && self.sessions.as_ref(app).is_empty() {
+            return false;
+        }
         // Warp's own headless TUI (`warp_tui`) is itself an agent surface, so
         // suppress the outer agent input bar while it runs in this pane. Uses
         // the same command-based detection as the CLI agent footer (see
@@ -9100,10 +9114,17 @@ impl TerminalView {
 
     pub fn is_long_running(&self) -> bool {
         let model = self.model.lock();
-        model
-            .block_list()
-            .active_block()
-            .is_active_and_long_running()
+        // An adopted (tmux) pane always passes keys through: the shell it
+        // mirrors owns its own line editor, so there is nothing for Warp's
+        // input editor to do.
+        // A raw (not-yet-warpified) adopted pane always passes keys through; once
+        // warpified it behaves like any Warp pane, so fall through to the normal
+        // long-running check.
+        (model.is_raw_adopted_pane()
+            || model
+                .block_list()
+                .active_block()
+                .is_active_and_long_running())
             && !model.is_read_only()
     }
 
@@ -9209,6 +9230,62 @@ impl TerminalView {
         }
     }
 
+    /// Mark this view as an adopted tmux pane and give it the commands its
+    /// context menu issues against that pane's window.
+    pub fn set_tmux_pane_commands(
+        &mut self,
+        commands: TmuxPaneCommands,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let pane = commands.pane();
+        self.tmux = Some(commands);
+        let was_warpified = crate::terminal::tmux_tty::process::warpified_panes().contains(&pane);
+        // Bootstrapping types a line into the pane, so it can only run while the
+        // shell owns the prompt. A pane left running an editor or a coding agent
+        // would receive the script as input instead, so it stays raw and keeps
+        // the banner for whenever the user is back at a prompt.
+        let at_prompt = crate::terminal::tmux_tty::process::pane_is_at_shell_prompt(pane);
+        if was_warpified && at_prompt {
+            // The user warpified this pane in an earlier attach and tmux still
+            // remembers, so restore it instead of asking again.
+            self.trigger_subshell_bootstrap(None, false, ctx);
+        } else {
+            // The pane mirrors a shell Warp did not start, so offer to warpify
+            // it the same way a subshell is offered: raw until the user opts in.
+            let warpify_keybinding = keybinding_name_to_keystroke("terminal:warpify_subshell", ctx);
+            self.show_warpify_banner(
+                "tmux".to_string(),
+                "tmux pane",
+                "tmux pane",
+                warpify_keybinding,
+                TelemetryEvent::ShowSubshellBanner,
+                ctx,
+            );
+        }
+        ctx.notify();
+    }
+
+    /// Re-run the warpify bootstrap for this adopted pane. No-op unless the
+    /// pane is adopted, still raw, and has no confirmed session yet.
+    pub fn rewarpify_adopted_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.tmux.is_none() || self.tmux_warpified || !self.sessions.as_ref(ctx).is_empty() {
+            return;
+        }
+        self.trigger_subshell_bootstrap(None, false, ctx);
+    }
+
+    /// Send a raw tmux control command from this pane's control stream. Returns
+    /// whether this is an adopted tmux pane at all.
+    pub fn send_tmux_command(&self, command: &[u8]) -> bool {
+        match &self.tmux {
+            Some(tmux) => {
+                tmux.send_raw(command.to_vec());
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn set_show_pane_accent_border(
         &mut self,
         show_accent_border: bool,
@@ -9243,6 +9320,15 @@ impl TerminalView {
     fn should_write_typed_chars_to_pty(&self, ctx: &mut ViewContext<Self>) -> bool {
         // Lock the model once and hold it throughout the function
         let model = self.model.lock();
+
+        // An adopted (tmux) pane mirrors a shell running its own line editor, so
+        // printable characters belong to it until Warp has positive evidence the
+        // shell bootstrapped (a registered session). Flipping on the mere
+        // *attempt* would strand the pane with neither raw input nor a working
+        // input box if the shell never answered.
+        if model.is_adopted_pane() && self.sessions.as_ref(ctx).is_empty() {
+            return true;
+        }
 
         // If the active block hasn't started yet, we don't want to write to the pty.
         // Note that we check block started and NOT block.is_long_running(), because
@@ -9731,14 +9817,53 @@ impl TerminalView {
         // If the remote never emits InitShell, the block stays visible.
         {
             let model = self.model.lock();
-            if model
-                .block_list()
-                .active_block()
-                .is_active_and_long_running()
+            // Adopted (tmux) panes record unconditionally: their block is
+            // created moments before bootstrap fires, so it is never
+            // long-running yet, and without the record the injected script
+            // stays visible instead of being hidden on confirmation.
+            if model.is_adopted_pane()
+                || model
+                    .block_list()
+                    .active_block()
+                    .is_active_and_long_running()
             {
                 let block_id = model.block_list().active_block_id().clone();
                 self.warpify_state.set_block_id(block_id);
             }
+        }
+
+        // The model is flipped out of raw passthrough only when the shell
+        // CONFIRMS bootstrap (handle_session_bootstrapped); flipping on the
+        // attempt stranded the pane when the handshake never completed.
+        // Persist the choice in tmux so reattaching restores it per pane.
+        if let Some(tmux) = &self.tmux {
+            tmux.mark_warpified();
+            self.tmux_warpified = true;
+            // A shell warpified in an earlier attach still has WARP_BOOTSTRAPPED
+            // set, which turns the bootstrap script into a no-op: no new
+            // handshake, no new session id, and its stale-id DCS hooks are
+            // rejected forever. Clear the guard so the handshake re-runs.
+            // Hide the block up front so the injected script never renders;
+            // the bootstrap-failed timer unhides it if the shell never answers.
+            let show_debug_block = BlockVisibilitySettings::as_ref(ctx)
+                .should_show_ssh_block
+                .value();
+            if !show_debug_block {
+                self.update_long_running_ssh_block_with_lock(|block| block.hide());
+            }
+            // Turn off terminal echo first: the multi-KB bootstrap body is typed
+            // into the pane's shell, which would otherwise echo every line back.
+            // A warpified pane types through Warp's own input editor, so the
+            // shell never needs to echo again; the failed-bootstrap timer turns
+            // it back on if the handshake never completes.
+            self.write_to_pty(b" stty -echo 2>/dev/null\r".to_vec(), ctx);
+            // Branches on FISH_VERSION because fish has no `unset` builtin;
+            // neither branch runs an unknown command in any shell.
+            self.write_to_pty(
+                b" [ -n \"$FISH_VERSION\" ] && set -e WARP_BOOTSTRAPPED 2>/dev/null; [ -z \"$FISH_VERSION\" ] && unset WARP_BOOTSTRAPPED\r"
+                    .to_vec(),
+                ctx,
+            );
         }
 
         self.write_init_subshell_bytes_to_pty(shell_type, ctx);
@@ -9811,6 +9936,14 @@ impl TerminalView {
             self.update_long_running_ssh_block_with_lock(|block| {
                 block.hide();
             });
+        }
+
+        // An adopted (tmux) pane re-bootstraps on every reattach; repeating the
+        // success card (and its add-to-rc snippet) each time is pure noise. The
+        // pane visibly becoming a Warp terminal is the confirmation.
+        if self.model.lock().is_adopted_pane() {
+            self.clear_ssh_blocks(ctx);
+            return;
         }
 
         let warpification_source = match session_type {
@@ -13556,6 +13689,15 @@ impl TerminalView {
             return;
         };
 
+        // An adopted (tmux) pane joins Warp's block UI only now, on the
+        // shell's own confirmation - never on the injection attempt.
+        {
+            let mut model = self.model.lock();
+            if model.is_adopted_pane() {
+                model.set_adopted_pane_warpified();
+            }
+        }
+
         // Ensure that the new session's working directory and environment are persisted.
         ctx.dispatch_global_action("workspace:save_app", ());
 
@@ -16027,6 +16169,37 @@ impl TerminalView {
     /// Will send telemetry if the current session is not bootstrapped and will show a banner to
     /// the user if this is the first bootstrap in the session.
     fn on_bootstrap_failed_timer_complete(&mut self, _: (), ctx: &mut ViewContext<Self>) {
+        // Adopted (tmux) panes: the generic path below early-returns for them
+        // (their synthetic block list always reads as bootstrapped), so a failed
+        // warpify would be silent and unretryable. Reset to raw and offer the
+        // banner again; tmux keeps the @warp_warpified mark so the next attach
+        // still auto-retries.
+        if self.model.lock().is_adopted_pane() {
+            if self.sessions.as_ref(ctx).is_empty() && self.tmux_warpified {
+                self.tmux_warpified = false;
+                // Restore the echo we turned off before injecting, so the raw
+                // pane shows the user's typing again.
+                self.write_to_pty(b" stty echo 2>/dev/null\r".to_vec(), ctx);
+                // The script block was hidden at injection; without an unhide
+                // every later byte of shell output would render into a hidden
+                // block and the pane would look dead.
+                self.update_long_running_ssh_block_with_lock(|block| {
+                    block.unhide();
+                });
+                let warpify_keybinding =
+                    keybinding_name_to_keystroke("terminal:warpify_subshell", ctx);
+                self.show_warpify_banner(
+                    "tmux".to_string(),
+                    "tmux pane",
+                    "tmux pane",
+                    warpify_keybinding,
+                    TelemetryEvent::ShowSubshellBanner,
+                    ctx,
+                );
+                ctx.notify();
+            }
+            return;
+        }
         let (is_ssh, shell, is_subshell, was_triggered_by_rc_file, is_wsl, is_msys2) = {
             let model = self.model.lock();
 
@@ -17284,6 +17457,24 @@ impl TerminalView {
         shell: Option<AvailableShell>,
         ctx: &mut ViewContext<Self>,
     ) -> Vec<MenuItem<TerminalAction>> {
+        // tmux owns an adopted pane's layout, so it gets tmux's own commands
+        // rather than Warp's splits.
+        if let Some(tmux) = &self.tmux {
+            // Read the view's own flag: callers still hold the model lock here,
+            // and re-locking it would deadlock the UI thread.
+            let running = (!self.tmux_warpified)
+                .then(|| {
+                    crate::terminal::tmux_tty::process::pane_foreground_commands()
+                        .get(&tmux.pane())
+                        .filter(|cmd| {
+                            !crate::terminal::tmux_tty::process::is_known_shell(cmd.as_str())
+                        })
+                        .cloned()
+                })
+                .flatten();
+            return Self::tmux_pane_context_menu_items(self.tmux_warpified, running);
+        }
+
         let mut items = vec![];
 
         if ContextFlag::CreateNewSession.is_enabled() {
@@ -17344,6 +17535,55 @@ impl TerminalView {
         }
 
         items
+    }
+
+    /// Pane menu for an adopted tmux pane. Each item shows the tmux command it
+    /// runs, so the session stays legible to anyone who also drives tmux by
+    /// hand.
+    fn tmux_pane_context_menu_items(
+        is_warpified: bool,
+        running_command: Option<String>,
+    ) -> Vec<MenuItem<TerminalAction>> {
+        let warpify_item = if is_warpified {
+            MenuItemFields::new("Warpified")
+                .with_disabled(true)
+                .with_key_shortcut_label(Some("blocks, input editor, AI"))
+        } else if let Some(running) = running_command {
+            // Warpifying types a line into the pane, so it would land in this
+            // program's input rather than the shell's.
+            MenuItemFields::new(format!("Warpify needs a shell prompt (running {running})"))
+                .with_disabled(true)
+        } else {
+            MenuItemFields::new("Warpify this pane")
+                .with_on_select_action(TerminalAction::TriggerSubshellBootstrap)
+                .with_key_shortcut_label(Some("adds blocks + AI"))
+        };
+        vec![
+            warpify_item.into_item(),
+            MenuItem::Separator,
+            MenuItemFields::new("Split right")
+                .with_on_select_action(TerminalAction::TmuxSplit { horizontal: true })
+                .with_key_shortcut_label(Some("split-window -h"))
+                .into_item(),
+            MenuItemFields::new("Split down")
+                .with_on_select_action(TerminalAction::TmuxSplit { horizontal: false })
+                .with_key_shortcut_label(Some("split-window -v"))
+                .into_item(),
+            MenuItem::Separator,
+            MenuItemFields::new("Detach session")
+                .with_on_select_action(TerminalAction::TmuxDetach)
+                .with_key_shortcut_label(Some("detach-client"))
+                .into_item(),
+            MenuItem::Separator,
+            MenuItemFields::new("Kill pane")
+                .with_on_select_action(TerminalAction::TmuxKillPane)
+                .with_key_shortcut_label(Some("kill-pane"))
+                .into_item(),
+            MenuItemFields::new("Kill window")
+                .with_on_select_action(TerminalAction::TmuxKillWindow)
+                .with_key_shortcut_label(Some("kill-window"))
+                .into_item(),
+        ]
     }
 
     fn input_is_on_git_branch(&self, model: &TerminalModel) -> bool {
@@ -21054,12 +21294,28 @@ impl TerminalView {
             let model = self.model.lock();
             self.is_input_box_visible(&model, ctx)
         };
+        // Computed before the model lock: an adopted pane must keep terminal
+        // focus until its shell has actually bootstrapped, otherwise focus falls
+        // to an input box that is hidden yet still swallows every keystroke.
+        // An adopted tmux pane must hold focus whenever there is no visible input
+        // box to hand it to. Keying this off session state was wrong: merely
+        // *attempting* a bootstrap registers a pending session, which dropped
+        // focus while the input box was still hidden - printable characters are
+        // only dispatched to a focused terminal, so every one of them was lost.
+        let adopted_pane_needs_focus = {
+            let model = self.model.lock();
+            model.is_adopted_pane() && !is_input_visible
+        };
         let should_focus_terminal = {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             let model = self.model.lock();
             let block_list = model.block_list();
 
             let has_bootstrapped = model.block_list().is_bootstrapping_precmd_done();
+
+            // An adopted tmux pane has no usable Warp input box until its shell
+            // bootstraps, so the terminal holds focus and keystrokes reach tmux.
+            let is_adopted_pane = adopted_pane_needs_focus;
 
             let has_active_user_terminal_command = block_list.active_block().is_active_and_long_running()
                 && !block_list.active_block().is_agent_in_control()
@@ -21094,7 +21350,9 @@ impl TerminalView {
                 && (are_blocks_selected || is_text_selected)
                 && selection_holds_focus;
 
-            has_active_user_terminal_command || has_block_or_text_selection_in_shell_mode
+            is_adopted_pane
+                || has_active_user_terminal_command
+                || has_block_or_text_selection_in_shell_mode
         };
         let blocked_cli_subagent_view = {
             let model = self.model.lock();
@@ -26456,6 +26714,10 @@ impl TypedActionView for TerminalView {
             | SplitLeft(_)
             | SplitDown(_)
             | SplitUp(_)
+            | TmuxSplit { .. }
+            | TmuxKillPane
+            | TmuxKillWindow
+            | TmuxDetach
             | OpenGridLink(_)
             | OpenRichContentLink(_)
             | ToggleGridSecret { .. }
@@ -26843,6 +27105,28 @@ impl TypedActionView for TerminalView {
             }
             SplitUp(chosen_shell) => {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
+            }
+            // tmux applies these and reports back over the control stream; the
+            // tab follows from the resulting notifications.
+            TmuxSplit { horizontal } => {
+                if let Some(tmux) = &self.tmux {
+                    tmux.split(*horizontal);
+                }
+            }
+            TmuxKillPane => {
+                if let Some(tmux) = &self.tmux {
+                    tmux.kill_pane();
+                }
+            }
+            TmuxKillWindow => {
+                if let Some(tmux) = &self.tmux {
+                    tmux.kill_window();
+                }
+            }
+            TmuxDetach => {
+                if let Some(tmux) = &self.tmux {
+                    tmux.detach();
+                }
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
             PromptContextMenu {
@@ -28365,6 +28649,12 @@ impl View for TerminalView {
 
         if model_lock.is_alt_screen_active() {
             context.set.insert("AltScreen");
+        }
+
+        // An adopted (tmux) pane passes keys through raw for its whole life, not
+        // just while a long-running command is active.
+        if model_lock.is_raw_adopted_pane() && !model_lock.is_alt_screen_active() {
+            context.set.insert("LongRunningCommand");
         }
 
         let active_block = model_lock.block_list().active_block();

@@ -576,6 +576,7 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
                 hook.name(),
                 session_id.as_u64()
             );
+            self.handler.on_unregistered_session_hook(hook.name());
             return false;
         }
         true

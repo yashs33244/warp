@@ -4,8 +4,9 @@ use ::settings::ToggleableSetting;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_errors::report_error;
 use warp_graphql::mutations::create_anonymous_user::AnonymousUserType;
+use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback, ModalButton};
 use warpui::windowing::WindowManager;
-use warpui::{AppContext, SingletonEntity, TypedActionView};
+use warpui::{AppContext, SingletonEntity, TypedActionView, ViewHandle};
 
 use crate::ai::agent::AIAgentExchangeId;
 use crate::ai::agent::conversation::AIConversationId;
@@ -102,6 +103,7 @@ pub fn init_global_actions(app: &mut AppContext) {
         "workspace:attach_tmux_control_mode",
         attach_tmux_control_mode,
     );
+    app.add_global_action("workspace:manage_tmux_sessions", manage_tmux_sessions);
     app.add_global_action("app:undo_close", undo_close);
     app.add_global_action("app:maybe_log_out", trigger_maybe_log_out);
     app.add_global_action("app:log_out", trigger_log_out);
@@ -240,6 +242,9 @@ fn open_repository(path: &String, ctx: &mut AppContext) {
 /// Starts a `tmux -CC` control-mode session in the active workspace. Dispatched
 /// (deferred) from [`WorkspaceAction::AttachTmuxControlMode`] so it runs after the
 /// workspace view update completes; no-op unless the integration is enabled.
+///
+/// With tmux sessions already running, offers them for attach (plus a "New
+/// session" choice); otherwise it starts a new session straight away.
 fn attach_tmux_control_mode(_: &(), ctx: &mut AppContext) {
     if !crate::terminal::tmux_tty::is_enabled() {
         return;
@@ -253,7 +258,108 @@ fn attach_tmux_control_mode(_: &(), ctx: &mut AppContext) {
     else {
         return;
     };
-    if let Err(err) = crate::terminal::tmux_tty::attach(&workspace, None, ctx) {
+
+    // Always ask, even with no sessions running: silently creating one leaves
+    // the user unsure whether the command did anything at all.
+    let sessions = crate::terminal::tmux_tty::process::list_sessions();
+
+    let mut buttons: Vec<ModalButton<AppModalCallback>> = sessions
+        .iter()
+        .map(|name| {
+            let workspace = workspace.clone();
+            let name = name.clone();
+            ModalButton::for_app(name.clone(), move |ctx| {
+                attach_tmux_session(&workspace, Some(&name), ctx);
+            })
+        })
+        .collect();
+    let new_session_workspace = workspace.clone();
+    buttons.push(ModalButton::for_app("New session", move |ctx| {
+        attach_tmux_session(&new_session_workspace, None, ctx);
+    }));
+    buttons.push(ModalButton::for_app("Cancel", |_ctx| {}));
+
+    let info = if sessions.is_empty() {
+        "No tmux sessions are running. Start a new one to mirror it as native Warp panes."
+            .to_string()
+    } else {
+        format!(
+            "{} running session(s). Attaching mirrors a session as native Warp panes and leaves its own layout untouched.",
+            sessions.len()
+        )
+    };
+    let dialog = AlertDialogWithCallbacks::for_app("Attach tmux session", info, buttons, |_ctx| {});
+    workspace.update(ctx, |workspace, ctx| {
+        workspace.show_native_modal(dialog, ctx)
+    });
+}
+
+/// The destructive half of the session picker: kill a session outright.
+///
+/// A separate command rather than a button on the attach dialog: a modal button
+/// callback runs while the modal view is mid-update, so opening a second modal
+/// from inside one re-enters that view and panics.
+fn manage_tmux_sessions(_: &(), ctx: &mut AppContext) {
+    if !crate::terminal::tmux_tty::is_enabled() {
+        return;
+    }
+    let Some(window_id) = WindowManager::as_ref(ctx).active_window() else {
+        return;
+    };
+    let Some(workspace) = ctx
+        .views_of_type::<Workspace>(window_id)
+        .and_then(|workspaces| workspaces.into_iter().next())
+    else {
+        return;
+    };
+    show_tmux_session_manager(&workspace, ctx);
+}
+
+fn show_tmux_session_manager(workspace: &ViewHandle<Workspace>, ctx: &mut AppContext) {
+    let sessions = crate::terminal::tmux_tty::process::list_sessions();
+    if sessions.is_empty() {
+        return;
+    }
+    let mut buttons: Vec<ModalButton<AppModalCallback>> = sessions
+        .into_iter()
+        .map(|name| {
+            ModalButton::for_app(format!("Kill {name}"), move |ctx| {
+                kill_tmux_session(&name, ctx);
+            })
+        })
+        .collect();
+    buttons.push(ModalButton::for_app("Cancel", |_ctx| {}));
+
+    let dialog = AlertDialogWithCallbacks::for_app(
+        "Manage tmux sessions",
+        "Killing a session ends every shell running in it. This cannot be undone.",
+        buttons,
+        |_ctx| {},
+    );
+    workspace.update(ctx, |workspace, ctx| {
+        workspace.show_native_modal(dialog, ctx)
+    });
+}
+
+/// Kills a tmux session outright, ending every shell running in it. Warp's own
+/// tabs are left alone; the control session's panes stop receiving output and
+/// tmux reports `%exit`.
+fn kill_tmux_session(name: &str, _ctx: &mut AppContext) {
+    let killed =
+        command::blocking::Command::new(crate::terminal::tmux_tty::process::tmux_program())
+            .args(["kill-session", "-t", name])
+            .status();
+    if let Err(err) = killed {
+        report_error!(anyhow::Error::new(err).context("Failed to kill tmux session"));
+    }
+}
+
+fn attach_tmux_session(
+    workspace: &ViewHandle<Workspace>,
+    target: Option<&str>,
+    ctx: &mut AppContext,
+) {
+    if let Err(err) = crate::terminal::tmux_tty::attach(workspace, target, ctx) {
         report_error!(anyhow::Error::new(err).context("Failed to attach tmux control mode"));
     }
 }

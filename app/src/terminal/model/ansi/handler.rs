@@ -249,6 +249,11 @@ pub trait Handler {
         true
     }
 
+    /// Called when a hook is rejected because its session id is not
+    /// registered. Lets an implementor react to a shell that is still
+    /// emitting hooks from an earlier, no-longer-known session.
+    fn on_unregistered_session_hook(&mut self, _hook_name: &str) {}
+
     /// Callback for the Warp CommandFinished hook.
     fn command_finished(&mut self, _data: CommandFinishedValue) {}
 

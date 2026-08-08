@@ -67,7 +67,13 @@ impl TmuxTerminalManager {
 
         let channel_event_proxy = ChannelEventListener::new(wakeups_tx, events_tx, pty_reads_tx);
 
-        let model = terminal_manager::create_terminal_model(
+        // The debug memory-stats footer is a per-block affordance; an adopted
+        // pane has a single synthetic block, so it would just draw a stray stats
+        // line pinned across the pane's bottom edge.
+        let mut block_spacing = BlockSpacing::for_gui(ctx);
+        block_spacing.show_memory_stats = false;
+
+        let mut model = terminal_manager::create_terminal_model(
             None, /* startup_directory */
             None, /* restored_blocks */
             initial_size,
@@ -79,9 +85,15 @@ impl TmuxTerminalManager {
                 available_shell: None,
                 display_name: ShellName::blank(),
             },
-            BlockSpacing::for_gui(ctx),
+            block_spacing,
             ctx,
         );
+        // The shell in a tmux pane is already running and never performs Warp's
+        // bootstrap handshake, so mark the pane bootstrapped ourselves; without
+        // this it rejects input and renders its output into a hidden block.
+        model.block_list_mut().simulate_bootstrap_for_adopted_pane();
+        // ...and route every keystroke to tmux instead of Warp's input editor.
+        model.set_adopted_pane();
         let colors = model.colors();
         let model = Arc::new(FairMutex::new(model));
 

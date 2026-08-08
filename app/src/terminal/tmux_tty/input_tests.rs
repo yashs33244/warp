@@ -4,14 +4,19 @@ use warp_terminal::tmux::command;
 
 use super::{TmuxInputSender, TmuxResponder};
 use crate::terminal::SizeInfo;
+use crate::terminal::tmux_tty::geometry::TmuxGeometry;
 use crate::terminal::writeable_pty::Message;
 use crate::terminal::writeable_pty::pty_controller::EventLoopSender;
 
+const WINDOW: u32 = 3;
 const PANE: u32 = 7;
 
 fn sender() -> (TmuxInputSender, async_channel::Receiver<Vec<u8>>) {
     let (tx, rx) = async_channel::unbounded();
-    (TmuxInputSender::new(PANE, tx), rx)
+    (
+        TmuxInputSender::new(WINDOW, PANE, TmuxGeometry::default(), tx),
+        rx,
+    )
 }
 
 #[test]
@@ -30,7 +35,12 @@ fn resize_becomes_refresh_client_size() {
     let size = SizeInfo::new_without_font_metrics(24, 80);
     sender.send(Message::Resize(size)).expect("send succeeds");
     let sent = rx.try_recv().expect("one command queued");
-    assert_eq!(sent, command::refresh_client_size(80, 24));
+    assert_eq!(sent, command::refresh_client_window_size(WINDOW, 80, 24));
+    // Repeating the same size is dropped, so tmux's answering layout change
+    // cannot bounce back as another resize.
+    let size = SizeInfo::new_without_font_metrics(24, 80);
+    sender.send(Message::Resize(size)).expect("send succeeds");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

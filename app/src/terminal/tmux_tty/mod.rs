@@ -16,6 +16,8 @@
 //!   session decides with.
 //! - [`flow_control`] holds the pure per-pane pause/continue bookkeeping and
 //!   bounded backlog the session uses for tmux flow control.
+//! - [`geometry`] tracks the grid tmux laid each pane and window out at, so a
+//!   Warp-side pane resize can be expressed as the window size tmux needs.
 //! - [`input`] turns terminal input/resizes into `send-keys`/`refresh-client`
 //!   commands.
 //! - [`event_loop`] reads the control stream and drives the session.
@@ -26,6 +28,7 @@
 
 pub mod event_loop;
 pub mod flow_control;
+pub mod geometry;
 pub mod input;
 pub mod layout_map;
 pub mod lifecycle;
@@ -74,9 +77,20 @@ pub fn attach(
     if !is_enabled() {
         return Ok(());
     }
+    // Only one control session per workspace: all adopted panes share one map,
+    // so a second session's `%exit` would close the first's panes.
+    let already_active = workspace.update(ctx, |workspace, _| {
+        let active = workspace.has_active_tmux_control_session();
+        if !active {
+            workspace.set_tmux_control_active(true);
+        }
+        active
+    });
+    if already_active {
+        return Ok(());
+    }
 
-    let executor = ctx.background_executor();
-    let process = process::spawn_control_process(target, executor)?;
+    let process = process::spawn_control_process(target)?;
 
     // Turn on tmux flow control: a pane the client falls behind on is paused
     // (via `%pause`) instead of flooding the shared control stream, and the
@@ -87,6 +101,11 @@ pub fn attach(
         .try_send(command::refresh_client_pause_after(
             FLOW_CONTROL_PAUSE_AFTER_SECS,
         ));
+    // Bootstrap the current windows: tmux does not emit `%layout-change` for a
+    // window that already exists at attach time (it sends `%window-add`), so we
+    // seed the first tab(s) from the `list-windows` reply. Later windows are
+    // queried the same way when their `%window-add` arrives.
+    let _ = process.input_tx.try_send(command::list_windows());
 
     let session = session::TmuxSession::new();
     let workspace_weak = workspace.downgrade();
@@ -96,6 +115,7 @@ pub fn attach(
             session,
             process.control_rx,
             process.input_tx,
+            process.handle,
             workspace_weak,
             model_ctx,
         )

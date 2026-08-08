@@ -1,4 +1,5 @@
 use super::drain_complete_lines;
+use super::parse_window_layout_line;
 use super::{LifecycleEffect, TmuxSession};
 
 // Valid tmux 3.5a layout strings (checksum + body) reused from the protocol
@@ -111,4 +112,97 @@ fn pause_requests_a_resume() {
     // The continue notification just clears bookkeeping; no effect is emitted.
     let resumed = session.feed_control_bytes(b"%continue %4\n");
     assert!(resumed.is_empty());
+}
+
+#[test]
+fn strips_dcs_intro_so_first_line_parses() {
+    let mut session = TmuxSession::new();
+    // tmux prefixes the stream with the DCS intro glued to the first control
+    // line; without stripping it the first line would fail to parse.
+    let mut bytes = b"\x1bP1000p".to_vec();
+    bytes.extend_from_slice(&layout_change_line(1, V2));
+    match session.feed_control_bytes(&bytes).as_slice() {
+        [LifecycleEffect::WindowLayout { window, .. }] => assert_eq!(*window, 1),
+        other => panic!("expected the first line to parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn strips_dcs_intro_split_across_chunks() {
+    let mut session = TmuxSession::new();
+    // The 7-byte intro can straddle a read boundary; stripping must defer until
+    // enough bytes have arrived to match it.
+    assert!(session.feed_control_bytes(b"\x1bP10").is_empty());
+    let mut rest = b"00p".to_vec();
+    rest.extend_from_slice(&layout_change_line(1, V2));
+    match session.feed_control_bytes(&rest).as_slice() {
+        [LifecycleEffect::WindowLayout { window, .. }] => assert_eq!(*window, 1),
+        other => panic!("expected the first line to parse, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_windows_reply_bootstraps_a_window() {
+    let mut session = TmuxSession::new();
+    // tmux emits no `%layout-change` on attach; the tab is seeded from the
+    // `list-windows` reply body instead.
+    let reply = format!("%begin 100 5 1\n@1 {V2}\n%end 100 5 1\n").into_bytes();
+    match session.feed_control_bytes(&reply).as_slice() {
+        [LifecycleEffect::WindowLayout { window, delta, .. }] => {
+            assert_eq!(*window, 1);
+            assert_eq!(delta.added, vec![1, 2]);
+        }
+        other => panic!("expected one WindowLayout effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_windows_reply_bootstraps_every_window() {
+    let mut session = TmuxSession::new();
+    let reply = format!("%begin 1 1 1\n@1 {V2}\n@2 {V1}\n%end 1 1 1\n").into_bytes();
+    match session.feed_control_bytes(&reply).as_slice() {
+        [
+            LifecycleEffect::WindowLayout { window: w1, .. },
+            LifecycleEffect::WindowLayout { window: w2, .. },
+        ] => {
+            assert_eq!(*w1, 1);
+            assert_eq!(*w2, 2);
+        }
+        other => panic!("expected two WindowLayout effects, got {other:?}"),
+    }
+}
+
+#[test]
+fn failed_or_empty_reply_yields_no_effect() {
+    let mut session = TmuxSession::new();
+    // An empty-bodied success (e.g. a send-keys ack) produces nothing.
+    assert!(
+        session
+            .feed_control_bytes(b"%begin 2 3 1\n%end 2 3 1\n")
+            .is_empty()
+    );
+    // A failed command (`%error`) is ignored even if its body looks like a layout.
+    let err = format!("%begin 3 4 1\n@1 {V2}\n%error 3 4 1\n").into_bytes();
+    assert!(session.feed_control_bytes(&err).is_empty());
+}
+
+#[test]
+fn parse_window_layout_line_accepts_well_formed_lines() {
+    assert_eq!(
+        parse_window_layout_line(b"@0 aafd,120x40,0,0,0"),
+        Some((0, "aafd,120x40,0,0,0".to_string()))
+    );
+    assert_eq!(
+        parse_window_layout_line(b"@12 layout"),
+        Some((12, "layout".to_string()))
+    );
+}
+
+#[test]
+fn parse_window_layout_line_rejects_malformed_lines() {
+    assert_eq!(parse_window_layout_line(b"no-space"), None);
+    assert_eq!(parse_window_layout_line(b"0 missing-at"), None);
+    assert_eq!(parse_window_layout_line(b"@ empty-id"), None);
+    assert_eq!(parse_window_layout_line(b"@1x non-digit"), None);
+    assert_eq!(parse_window_layout_line(b"@1 "), None);
 }

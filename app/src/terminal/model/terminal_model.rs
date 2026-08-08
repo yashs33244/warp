@@ -391,6 +391,23 @@ pub struct TerminalModel {
 
     alt_screen_active: bool,
 
+    /// Whether this model mirrors a pane Warp does not own, i.e. a tmux
+    /// control-mode pane. Such a pane wraps a shell that is already running its
+    /// own line editor, so Warp must pass every keystroke straight through
+    /// rather than capturing it into the block input editor.
+    is_adopted_pane: bool,
+
+    /// Whether an adopted pane's shell has since been warpified (Warp's
+    /// bootstrap injected, as for an SSH subshell). Once it has, the pane earns
+    /// the full block UI and stops behaving as a raw passthrough.
+    adopted_pane_warpified: bool,
+
+    /// Set when a not-yet-warpified adopted pane rejects a Precmd hook carrying
+    /// an unknown session id: the shell was warpified in an earlier attach and
+    /// has just returned to its prompt, which is exactly when re-injecting the
+    /// bootstrap is safe.
+    adopted_stale_precmd: bool,
+
     /// Stack of saved window titles. When a title is popped from this stack, the `title` for the
     /// term is set.
     title_stack: Vec<Option<String>>,
@@ -1067,6 +1084,9 @@ impl TerminalModel {
             lifecycle_coordinator: BlockLifecycleCoordinator::default(),
             blocklist_has_been_cleared: false,
             alt_screen_active: false,
+            is_adopted_pane: false,
+            adopted_pane_warpified: false,
+            adopted_stale_precmd: false,
             title_stack: Vec::new(),
             title: None,
             custom_title: None,
@@ -1581,11 +1601,14 @@ impl TerminalModel {
             TerminalInputState::NotBootstrapped
         } else if self.is_alt_screen_active() {
             TerminalInputState::AltScreen
-        } else if self
-            .block_list()
-            .active_block()
-            .is_active_and_long_running()
+        } else if self.is_raw_adopted_pane()
+            || self
+                .block_list()
+                .active_block()
+                .is_active_and_long_running()
         {
+            // An adopted pane's keystrokes always go straight to tmux, never to
+            // Warp's input editor.
             TerminalInputState::LongRunningCommand
         } else {
             TerminalInputState::InputEditor
@@ -1992,6 +2015,37 @@ impl TerminalModel {
 
     pub fn is_alt_screen_active(&self) -> bool {
         self.alt_screen_active
+    }
+
+    /// Whether this pane mirrors a shell Warp does not own (tmux control mode),
+    /// so keystrokes must be written straight through instead of being captured
+    /// by the block input editor.
+    pub fn is_adopted_pane(&self) -> bool {
+        self.is_adopted_pane
+    }
+
+    /// Mark this model as mirroring an adopted (tmux) pane. See
+    /// [`Self::is_adopted_pane`].
+    pub fn set_adopted_pane(&mut self) {
+        self.is_adopted_pane = true;
+    }
+
+    /// An adopted pane whose shell has not been warpified yet: keystrokes pass
+    /// straight through and Warp's input box stays hidden, because the shell
+    /// inside tmux is still driving its own line editor.
+    pub fn is_raw_adopted_pane(&self) -> bool {
+        self.is_adopted_pane && !self.adopted_pane_warpified
+    }
+
+    /// Record that this adopted pane's shell has been warpified, handing the
+    /// pane back to Warp's normal block UI.
+    pub fn set_adopted_pane_warpified(&mut self) {
+        self.adopted_pane_warpified = true;
+    }
+
+    /// Consume the stale-Precmd signal (see `adopted_stale_precmd`).
+    pub fn take_adopted_stale_precmd(&mut self) -> bool {
+        std::mem::take(&mut self.adopted_stale_precmd)
     }
 
     pub fn set_pending_shell_launch_data(&mut self, shell_launch_data: ShellLaunchData) {
@@ -2568,6 +2622,15 @@ impl ansi::Handler for TerminalModel {
 
     fn should_validate_dcs_hook_session_id(&self) -> bool {
         !self.shared_session_status().is_viewer()
+    }
+
+    fn on_unregistered_session_hook(&mut self, hook_name: &str) {
+        // A zombie-warpified shell (bootstrapped in an earlier attach) emits
+        // Precmd exactly when it is back at its prompt - the safe moment to
+        // re-run the bootstrap handshake.
+        if hook_name == "Precmd" && self.is_adopted_pane && !self.adopted_pane_warpified {
+            self.adopted_stale_precmd = true;
+        }
     }
 
     fn set_title(&mut self, title: Option<String>) {

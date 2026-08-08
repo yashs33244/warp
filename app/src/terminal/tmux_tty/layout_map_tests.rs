@@ -114,7 +114,7 @@ fn generic_branch(
 #[test]
 fn generic_mapper_preserves_shape_direction_and_flex() {
     let window = parse_layout(LAYOUT).expect("layout parses");
-    let tree = map_window_to(&window, &mut |pane| pane);
+    let tree = map_window_to(&window, &mut |pane, _cols, _rows| pane);
 
     let (dir, children) = generic_branch(&tree);
     assert_eq!(*dir, SplitDirection::Horizontal);
@@ -138,7 +138,7 @@ fn generic_mapper_preserves_shape_direction_and_flex() {
 fn generic_mapper_visits_leaves_depth_first_left_to_right() {
     let window = parse_layout(LAYOUT).expect("layout parses");
     let mut visited = Vec::new();
-    let _ = map_window_to(&window, &mut |pane| {
+    let _ = map_window_to(&window, &mut |pane, _cols, _rows| {
         visited.push(pane);
         pane
     });

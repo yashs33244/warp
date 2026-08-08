@@ -1483,6 +1483,14 @@ pub fn init(app: &mut AppContext) {
     .with_context_predicate(id!("Workspace"))]);
 
     app.register_editable_bindings([EditableBinding::new(
+        "workspace:manage_tmux_sessions",
+        "Manage tmux sessions",
+        WorkspaceAction::ManageTmuxSessions,
+    )
+    .with_enabled(crate::terminal::tmux_tty::is_enabled)
+    .with_context_predicate(id!("Workspace"))]);
+
+    app.register_editable_bindings([EditableBinding::new(
         "workspace:open_mcp_servers",
         BindingDescription::new("Open MCP Servers")
             .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Open MCP Servers"),
