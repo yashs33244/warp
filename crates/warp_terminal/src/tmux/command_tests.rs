@@ -168,7 +168,10 @@ fn capture_pane_format() {
 
 #[test]
 fn list_windows_format() {
-    assert_eq!(list_windows(), b"list-windows -F '#{window_layout}'\n");
+    assert_eq!(
+        list_windows(),
+        b"list-windows -F '#{window_id} #{window_layout}'\n"
+    );
 }
 
 #[test]
@@ -191,6 +194,8 @@ fn property_all_helpers_well_formed() {
         well_formed(&split_window(p, true));
         well_formed(&split_window(p, false));
         well_formed(&select_layout(p, "even-horizontal"));
+        well_formed(&select_pane(p));
+        well_formed(&rename_window(p, "my window").unwrap());
         well_formed(&capture_pane(p, None));
         for s in [i64::MIN, -1, 0, 1, i64::MAX] {
             well_formed(&capture_pane(p, Some(s)));
@@ -200,12 +205,14 @@ fn property_all_helpers_well_formed() {
         for &h in &dims {
             well_formed(&resize_pane(0, w, h));
             well_formed(&refresh_client_size(w, h));
+            well_formed(&refresh_client_window_size(0, w, h));
         }
         well_formed(&refresh_client_pause_after(w));
     }
     well_formed(&new_window());
     well_formed(&list_windows());
     well_formed(&detach_client());
+    well_formed(&kill_session());
 }
 
 #[test]
@@ -401,17 +408,21 @@ mod adversarial {
             well_formed(&split_window(p, true));
             well_formed(&split_window(p, false));
             well_formed(&select_layout(p, "tiled"));
+            well_formed(&select_pane(p));
+            well_formed(&rename_window(p, "  build  ").unwrap());
             well_formed(&capture_pane(p, None));
             for s in [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX] {
                 well_formed(&capture_pane(p, Some(s)));
             }
             well_formed(&resize_pane(p, p, p));
             well_formed(&refresh_client_size(p, p));
+            well_formed(&refresh_client_window_size(p, p, p));
             well_formed(&refresh_client_pause_after(p));
         }
         well_formed(&new_window());
         well_formed(&list_windows());
         well_formed(&detach_client());
+        well_formed(&kill_session());
     }
 
     // ---- helpers use @ for windows and % for panes, never confused ----
@@ -419,6 +430,10 @@ mod adversarial {
     fn window_vs_pane_sigils() {
         assert!(kill_window(3).starts_with(b"kill-window -t @3"));
         assert!(select_layout(3, "even-vertical").starts_with(b"select-layout -t @3 "));
+        assert_eq!(
+            refresh_client_window_size(3, 120, 40),
+            b"refresh-client -C @3:120x40\n"
+        );
         assert!(kill_pane(3).starts_with(b"kill-pane -t %3"));
         assert!(
             send_keys_hex(3, &[0])
