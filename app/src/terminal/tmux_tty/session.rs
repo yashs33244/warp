@@ -1,13 +1,14 @@
 //! Fans tmux control-mode output out to per-pane terminal models.
 
 use std::collections::HashMap;
-use std::io;
 use std::sync::Arc;
 
 use parking_lot::FairMutex;
 use warp_terminal::tmux::layout::{Window, parse_layout};
 use warp_terminal::tmux::notification::{ControlMessage, ControlParser, TmuxEvent};
 
+use super::flow_control::{FlowControl, OutputRoute};
+use super::input::TmuxResponder;
 use super::lifecycle::{LayoutDelta, diff_pane_ids, pane_ids};
 use crate::terminal::TerminalModel;
 use crate::terminal::event_listener::ChannelEventListener;
@@ -19,6 +20,9 @@ pub struct TmuxPaneSink {
     model: Arc<FairMutex<TerminalModel>>,
     parser: Processor,
     events: ChannelEventListener,
+    /// Routes the emulator's query replies back to tmux via `send-keys`. `None`
+    /// until the adoption path wires the pane's control write channel in.
+    responder: Option<TmuxResponder>,
 }
 
 impl TmuxPaneSink {
@@ -27,20 +31,31 @@ impl TmuxPaneSink {
             model,
             parser: Processor::new(),
             events,
+            responder: None,
         }
+    }
+
+    /// Attach the responder that forwards this pane's emulator replies to tmux.
+    pub fn with_responder(mut self, responder: TmuxResponder) -> Self {
+        self.responder = Some(responder);
+        self
     }
 
     /// Feed already-unescaped `%output` bytes into the pane's model (the same
     /// `ansi::Processor::parse_bytes` path `remote_tty` uses), then wake the
-    /// view so it repaints.
+    /// view so it repaints. Any reply the emulator generates (DSR/DA,
+    /// cursor-position) is routed back to tmux via the responder so full-screen
+    /// apps that query the terminal don't hang.
     pub fn feed_output(&mut self, data: &[u8]) {
+        let mut responses = Vec::new();
         {
             let mut model = self.model.lock();
-            // TODO(PR3-responses): the emulator's query replies (DSR/DA,
-            // cursor-position) currently go to `io::sink()` and are dropped;
-            // route them to the pane's input sender via `send-keys`, or
-            // full-screen apps that query the terminal will hang.
-            self.parser.parse_bytes(&mut *model, data, &mut io::sink());
+            self.parser.parse_bytes(&mut *model, data, &mut responses);
+        }
+        if !responses.is_empty()
+            && let Some(responder) = &self.responder
+        {
+            responder.send_response(&responses);
         }
         self.events.send_wakeup_event();
     }
@@ -70,6 +85,10 @@ pub enum LifecycleEffect {
     WindowClosed { window: u32 },
     /// tmux renamed a window; the caller retitles its tab.
     WindowRenamed { window: u32, name: String },
+    /// A pane was paused by tmux flow control (`%pause`); the caller resumes it
+    /// with `refresh-client -A '%<pane>:continue'` once it is ready for more
+    /// output. Buffered backlog is flushed when the matching `%continue` lands.
+    ResumePane { pane: u32 },
     /// The control session ended; the caller tears the whole session down.
     Exit { reason: Option<String> },
 }
@@ -85,6 +104,8 @@ pub struct TmuxSession {
     /// Known pane ids per window, tracked from `%layout-change` so the next
     /// change to the same window can be diffed into added/removed panes.
     window_panes: HashMap<u32, Vec<u32>>,
+    /// Per-pane pause state and bounded backlog for tmux flow control.
+    flow: FlowControl,
 }
 
 impl TmuxSession {
@@ -99,6 +120,7 @@ impl TmuxSession {
 
     /// Drop a pane that tmux has closed.
     pub fn remove_pane(&mut self, pane: u32) -> Option<TmuxPaneSink> {
+        self.flow.forget(pane);
         self.panes.remove(&pane)
     }
 
@@ -129,8 +151,35 @@ impl TmuxSession {
         };
         match event {
             TmuxEvent::Output { pane, data } => {
+                // A paused pane's output is buffered (bounded) rather than
+                // delivered, so a flooding pane can't stall the others.
+                match self.flow.route_output(pane, &data) {
+                    OutputRoute::Deliver => {
+                        if let Some(sink) = self.panes.get_mut(&pane) {
+                            sink.feed_output(&data);
+                        }
+                    }
+                    OutputRoute::Buffered => {}
+                }
+                None
+            }
+            TmuxEvent::ExtendedOutput { pane, data, .. } => {
+                // tmux replays a resumed pane's backlog as `%extended-output`
+                // (carrying an age we don't render); deliver it like `%output`.
                 if let Some(sink) = self.panes.get_mut(&pane) {
                     sink.feed_output(&data);
+                }
+                None
+            }
+            TmuxEvent::Pause { pane } => {
+                self.flow.pause(pane);
+                Some(LifecycleEffect::ResumePane { pane })
+            }
+            TmuxEvent::Continue { pane } => {
+                for chunk in self.flow.resume(pane) {
+                    if let Some(sink) = self.panes.get_mut(&pane) {
+                        sink.feed_output(&chunk);
+                    }
                 }
                 None
             }
@@ -148,6 +197,7 @@ impl TmuxSession {
             TmuxEvent::Exit { reason } => {
                 self.panes.clear();
                 self.window_panes.clear();
+                self.flow = FlowControl::default();
                 Some(LifecycleEffect::Exit { reason })
             }
             _ => None,
@@ -173,6 +223,7 @@ impl TmuxSession {
         let delta = diff_pane_ids(old_ids, &new_ids);
         for pane in &delta.removed {
             self.panes.remove(pane);
+            self.flow.forget(*pane);
         }
         self.window_panes.insert(window, new_ids);
         Some(LifecycleEffect::WindowLayout {
@@ -188,6 +239,7 @@ impl TmuxSession {
         if let Some(ids) = self.window_panes.remove(&window) {
             for pane in ids {
                 self.panes.remove(&pane);
+                self.flow.forget(pane);
             }
         }
     }

@@ -50,6 +50,33 @@ impl EventLoopSender for TmuxInputSender {
     }
 }
 
+/// Sends a pane's emulator-generated replies (DSR/DA cursor-position answers and
+/// other query responses) back to tmux as `send-keys` input, so full-screen apps
+/// that interrogate the terminal receive their answer instead of hanging.
+///
+/// Separate from [`TmuxInputSender`] because a sink emits raw response bytes
+/// rather than [`Message`]s, and the two live on opposite sides of the control
+/// stream (input path vs. output path) while sharing the same write channel.
+pub struct TmuxResponder {
+    pane: u32,
+    control_tx: async_channel::Sender<Vec<u8>>,
+}
+
+impl TmuxResponder {
+    pub fn new(pane: u32, control_tx: async_channel::Sender<Vec<u8>>) -> Self {
+        Self { pane, control_tx }
+    }
+
+    /// Forward `bytes` (the emulator's reply) to the pane via `send-keys -H`.
+    /// Empty replies and a closed control stream are silently ignored — a
+    /// dropped response only costs a redraw, never correctness.
+    pub fn send_response(&self, bytes: &[u8]) {
+        if let Ok(command) = command::send_keys_hex(self.pane, bytes) {
+            let _ = self.control_tx.try_send(command);
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "input_tests.rs"]
 mod tests;

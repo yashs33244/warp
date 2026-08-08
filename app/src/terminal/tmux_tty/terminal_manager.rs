@@ -7,6 +7,7 @@ use parking_lot::FairMutex;
 use pathfinder_geometry::vector::Vector2F;
 use warpui::{AppContext, ModelHandle, ViewHandle, WindowId};
 
+use super::input::TmuxInputSender;
 use crate::context_chips::prompt_type::PromptType;
 use crate::pane_group::TerminalViewResources;
 use crate::terminal::event_listener::ChannelEventListener;
@@ -14,6 +15,9 @@ use crate::terminal::model::session::Sessions;
 use crate::terminal::model_events::ModelEventDispatcher;
 use crate::terminal::shell::ShellName;
 use crate::terminal::terminal_manager::BlockSpacing;
+use crate::terminal::writeable_pty::terminal_manager_util::{
+    init_pty_controller_model, wire_up_pty_controller_with_surface,
+};
 use crate::terminal::{
     ShellLaunchState, TerminalManager, TerminalModel, TerminalView, terminal_manager,
 };
@@ -51,6 +55,7 @@ pub struct AdoptedTmuxPane {
 impl TmuxTerminalManager {
     pub fn create_model(
         resources: TerminalViewResources,
+        input_sender: TmuxInputSender,
         initial_size: Vector2F,
         window_id: WindowId,
         ctx: &mut AppContext,
@@ -58,7 +63,7 @@ impl TmuxTerminalManager {
         let (wakeups_tx, wakeups_rx) = async_channel::unbounded();
         let (events_tx, events_rx) = async_channel::unbounded();
         let (pty_reads_tx, _pty_reads_rx) = async_broadcast::broadcast(1);
-        let (executor_command_tx, _executor_command_rx) = async_channel::unbounded();
+        let (executor_command_tx, executor_command_rx) = async_channel::unbounded();
 
         let channel_event_proxy = ChannelEventListener::new(wakeups_tx, events_tx, pty_reads_tx);
 
@@ -85,6 +90,20 @@ impl TmuxTerminalManager {
         let model_events_dispatcher =
             ctx.add_model(|ctx| ModelEventDispatcher::new(events_rx, sessions.clone(), ctx));
 
+        // Broker for writes to this pane: user keystrokes routed through the
+        // view flow here and out to tmux as `send-keys` via `input_sender`.
+        let pty_controller = init_pty_controller_model(
+            input_sender,
+            executor_command_rx,
+            model_events_dispatcher.clone(),
+            sessions.clone(),
+            model.clone(),
+            ctx,
+        );
+
+        // Captured before `resources` is moved into the view below.
+        let model_event_sender = resources.model_event_sender.clone();
+
         let cloned_model = model.clone();
         let prompt_type =
             ctx.add_model(|ctx| PromptType::new_dynamic_from_sessions(sessions.clone(), ctx));
@@ -108,12 +127,26 @@ impl TmuxTerminalManager {
             )
         });
 
-        // Retain the model-events dispatcher for the life of the view (same
-        // trick as `MockTerminalManager`): give ownership to a closure held by
-        // a task that never completes.
+        // Route the view's input/resize `Message`s to the PtyController (and its
+        // disconnect events back), the same bi-directional wiring `local_tty`
+        // uses. This is what turns a keystroke in the adopted pane into a
+        // `send-keys` command to tmux.
+        wire_up_pty_controller_with_surface(
+            &pty_controller,
+            &view,
+            model.clone(),
+            sessions.clone(),
+            model_event_sender,
+            ctx,
+        );
+
+        // Retain the model-events dispatcher and PtyController for the life of
+        // the view (same trick as `MockTerminalManager`): give ownership to a
+        // closure held by a task that never completes.
         view.update(ctx, |_view, ctx| {
             ctx.spawn(futures::future::pending::<()>(), move |_, _, _| {
                 std::mem::drop(model_events_dispatcher);
+                std::mem::drop(pty_controller);
             });
         });
 

@@ -102,3 +102,13 @@ fn output_for_unknown_pane_yields_no_effect() {
     let effects = session.feed_control_bytes(b"%output %9 hello\n");
     assert!(effects.is_empty());
 }
+
+#[test]
+fn pause_requests_a_resume() {
+    let mut session = TmuxSession::new();
+    let effects = session.feed_control_bytes(b"%pause %4\n");
+    assert_eq!(effects, vec![LifecycleEffect::ResumePane { pane: 4 }]);
+    // The continue notification just clears bookkeeping; no effect is emitted.
+    let resumed = session.feed_control_bytes(b"%continue %4\n");
+    assert!(resumed.is_empty());
+}

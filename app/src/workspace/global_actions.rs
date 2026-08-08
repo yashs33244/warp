@@ -98,6 +98,10 @@ pub fn init_global_actions(app: &mut AppContext) {
         create_anonymous_user,
     );
     app.add_global_action("workspace:open_repository", open_repository);
+    app.add_global_action(
+        "workspace:attach_tmux_control_mode",
+        attach_tmux_control_mode,
+    );
     app.add_global_action("app:undo_close", undo_close);
     app.add_global_action("app:maybe_log_out", trigger_maybe_log_out);
     app.add_global_action("app:log_out", trigger_log_out);
@@ -230,6 +234,27 @@ fn open_repository(path: &String, ctx: &mut AppContext) {
         // No active window, create a new one with the repository path
         let path_buf = PathBuf::from(path);
         ctx.dispatch_global_action("root_view:open_new_from_path", &OpenPath { path: path_buf });
+    }
+}
+
+/// Starts a `tmux -CC` control-mode session in the active workspace. Dispatched
+/// (deferred) from [`WorkspaceAction::AttachTmuxControlMode`] so it runs after the
+/// workspace view update completes; no-op unless the integration is enabled.
+fn attach_tmux_control_mode(_: &(), ctx: &mut AppContext) {
+    if !crate::terminal::tmux_tty::is_enabled() {
+        return;
+    }
+    let Some(window_id) = WindowManager::as_ref(ctx).active_window() else {
+        return;
+    };
+    let Some(workspace) = ctx
+        .views_of_type::<Workspace>(window_id)
+        .and_then(|workspaces| workspaces.into_iter().next())
+    else {
+        return;
+    };
+    if let Err(err) = crate::terminal::tmux_tty::attach(&workspace, None, ctx) {
+        report_error!(anyhow::Error::new(err).context("Failed to attach tmux control mode"));
     }
 }
 

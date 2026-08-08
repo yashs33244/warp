@@ -415,6 +415,7 @@ use crate::terminal::session_settings::{
 use crate::terminal::settings::{SpacingMode, TerminalSettings};
 use crate::terminal::shared_session::SharedSessionActionSource;
 use crate::terminal::shell::ShellType;
+use crate::terminal::tmux_tty::input::{TmuxInputSender, TmuxResponder};
 use crate::terminal::tmux_tty::layout_map;
 use crate::terminal::tmux_tty::session::TmuxPaneSink;
 use crate::terminal::tmux_tty::terminal_manager::{AdoptedTmuxPane, TmuxTerminalManager};
@@ -12903,7 +12904,7 @@ impl Workspace {
         &mut self,
         window: u32,
         layout: &warp_terminal::tmux::layout::Window,
-        _input_tx: &async_channel::Sender<Vec<u8>>,
+        input_tx: &async_channel::Sender<Vec<u8>>,
         ctx: &mut ViewContext<Self>,
     ) -> Vec<(u32, TmuxPaneSink)> {
         let resources = TerminalViewResources {
@@ -12919,14 +12920,20 @@ impl Workspace {
 
         let mut sinks = Vec::new();
         let tree = layout_map::map_window_to(layout, &mut |pane| {
-            let init =
-                TmuxTerminalManager::create_model(resources.clone(), initial_size, window_id, ctx);
-            sinks.push((pane, TmuxPaneSink::new(init.model, init.events)));
-            // TODO(PR5-input): wire `TmuxInputSender::new(pane, _input_tx.clone())`
-            // as this pane's `EventLoopSender` (via `init_pty_controller_model` +
-            // `wire_up_pty_controller_with_surface`) so keystrokes reach tmux. The
-            // tmux manager mirrors `MockTerminalManager`, which has no
-            // `PtyController`, so this is new plumbing deferred to PR5.
+            // The pane's keystrokes reach tmux through this sender (wired as the
+            // manager's `EventLoopSender`); its emulator replies go back through
+            // a responder on the sink. Both share the control write channel.
+            let input_sender = TmuxInputSender::new(pane, input_tx.clone());
+            let init = TmuxTerminalManager::create_model(
+                resources.clone(),
+                input_sender,
+                initial_size,
+                window_id,
+                ctx,
+            );
+            let sink = TmuxPaneSink::new(init.model, init.events)
+                .with_responder(TmuxResponder::new(pane, input_tx.clone()));
+            sinks.push((pane, sink));
             AdoptedTmuxPane {
                 uuid: uuid::Uuid::new_v4().as_bytes().to_vec(),
                 manager: init.manager,
@@ -23979,6 +23986,11 @@ impl TypedActionView for Workspace {
                 position,
             } => self.toggle_vertical_tabs_pane_context_menu(*tab_index, *target, *position, ctx),
             ToggleTabBarOverflowMenu => self.toggle_tab_bar_overflow_menu(ctx),
+            AttachTmuxControlMode => {
+                // Deferred so the attach runs after this view update completes
+                // (it re-enters the workspace to retain the control loop).
+                ctx.dispatch_global_action("workspace:attach_tmux_control_mode", ());
+            }
             ToggleBlockSnackbar => self.toggle_block_snackbar(ctx),
             ToggleWelcomeTips => self.toggle_welcome_tips_visiblity(ctx),
             CloseTab(index) => self.close_tab(*index, false, true, ctx),

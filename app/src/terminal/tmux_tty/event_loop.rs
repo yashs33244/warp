@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 
 use async_channel::{Receiver, Sender};
+use warp_terminal::tmux::command;
 use warpui::{Entity, ModelContext, WeakViewHandle};
 
 use super::session::{LifecycleEffect, TmuxSession};
@@ -75,6 +76,15 @@ impl TmuxEventLoop {
                 for (pane, sink) in sinks {
                     self.session.register_pane(pane, sink);
                 }
+            }
+            LifecycleEffect::ResumePane { pane } => {
+                // Ask tmux to resume a flow-control-paused pane. We're a fast
+                // native consumer, so we always request resumption rather than
+                // leaving the pane stalled; the session's bounded buffer guards
+                // against a flooding pane in the meantime.
+                let _ = self
+                    .input_tx
+                    .try_send(command::refresh_client_continue(pane));
             }
             LifecycleEffect::WindowClosed { window } => {
                 self.adopted_windows.remove(&window);

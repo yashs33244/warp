@@ -14,6 +14,8 @@
 //!   and turns window/pane notifications into [`session::LifecycleEffect`]s.
 //! - [`lifecycle`] holds the context-free pane-set / layout-diff logic the
 //!   session decides with.
+//! - [`flow_control`] holds the pure per-pane pause/continue bookkeeping and
+//!   bounded backlog the session uses for tmux flow control.
 //! - [`input`] turns terminal input/resizes into `send-keys`/`refresh-client`
 //!   commands.
 //! - [`event_loop`] reads the control stream and drives the session.
@@ -23,6 +25,7 @@
 //! unconditionally so the pure logic stays type-checked and unit-tested.
 
 pub mod event_loop;
+pub mod flow_control;
 pub mod input;
 pub mod layout_map;
 pub mod lifecycle;
@@ -32,10 +35,16 @@ pub mod terminal_manager;
 
 use std::io;
 
+use warp_terminal::tmux::command;
 use warpui::{AppContext, ViewHandle};
 
 use crate::features::FeatureFlag;
 use crate::workspace::Workspace;
+
+/// Seconds a pane may fall behind before tmux flow-control pauses it (see
+/// [`command::refresh_client_pause_after`]). Small so a flood pauses promptly;
+/// the session resumes paused panes as soon as it drains them.
+const FLOW_CONTROL_PAUSE_AFTER_SECS: u32 = 1;
 
 /// Whether the tmux control-mode integration is active.
 pub fn is_enabled() -> bool {
@@ -68,6 +77,17 @@ pub fn attach(
 
     let executor = ctx.background_executor();
     let process = process::spawn_control_process(target, executor)?;
+
+    // Turn on tmux flow control: a pane the client falls behind on is paused
+    // (via `%pause`) instead of flooding the shared control stream, and the
+    // session resumes it once drained. Best-effort; a full input channel here
+    // only means the initial refresh is skipped.
+    let _ = process
+        .input_tx
+        .try_send(command::refresh_client_pause_after(
+            FLOW_CONTROL_PAUSE_AFTER_SECS,
+        ));
+
     let session = session::TmuxSession::new();
     let workspace_weak = workspace.downgrade();
 

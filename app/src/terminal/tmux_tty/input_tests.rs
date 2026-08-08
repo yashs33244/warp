@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use warp_terminal::tmux::command;
 
-use super::TmuxInputSender;
+use super::{TmuxInputSender, TmuxResponder};
 use crate::terminal::SizeInfo;
 use crate::terminal::writeable_pty::Message;
 use crate::terminal::writeable_pty::pty_controller::EventLoopSender;
@@ -46,5 +46,23 @@ fn empty_input_sends_nothing() {
 fn lifecycle_messages_send_nothing() {
     let (sender, rx) = sender();
     sender.send(Message::Shutdown).expect("send succeeds");
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn responder_forwards_reply_as_send_keys_hex() {
+    let (tx, rx) = async_channel::unbounded();
+    let responder = TmuxResponder::new(PANE, tx);
+    // A DSR cursor-position reply the emulator would generate.
+    responder.send_response(b"\x1b[1;1R");
+    let sent = rx.try_recv().expect("one command queued");
+    assert_eq!(sent, command::send_keys_hex(PANE, b"\x1b[1;1R").unwrap());
+}
+
+#[test]
+fn responder_ignores_empty_reply() {
+    let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
+    let responder = TmuxResponder::new(PANE, tx);
+    responder.send_response(b"");
     assert!(rx.try_recv().is_err());
 }
