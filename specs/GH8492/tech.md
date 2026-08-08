@@ -58,7 +58,7 @@ One global order: never acquire a `TerminalModel` lock while holding a `PaneGrou
 
 1. User clicks **Attach → "agents"**; Warp spawns `tmux -CC attach -t agents` as a byte source.
 2. The parser sees `\033P1000p` and diverts the stream to `TmuxGateway`.
-3. Gateway sends `refresh-client -C <client size>`, then `list-windows`/`list-panes -F '#{window_layout}#{alternate_on}…'`.
+3. Gateway sends `refresh-client -C <client size>`, then `list-windows`/`list-panes -F '#{window_layout}#{alternate_on}...'`.
 4. Per pane: text pane → `capture-pane` seed; TUI pane → live repaint. `add_tab_with_pane_layout(Snapshot)` builds native tabs + splits, one `TmuxTerminalManager` per pane.
 5. Live: `%output %N` → (wire-ordered) `Processor::parse_bytes` → model N → view; `%layout-change` → idempotent diff-apply.
 6. Keys: Warp binding? yes → Warp action; no → `send-keys -l -t %N`. Emulator DSR/DA reply → `send-keys`.
@@ -72,7 +72,7 @@ One global order: never acquire a `TerminalModel` lock while holding a `PaneGrou
 - **Collision with the existing `tmux_control_mode`/`TmuxCommandExecutor`.** Audit and coordinate reuse-vs-fresh before implementation; likely extract a shared parser rather than ship a second one. **(Open question for maintainers.)**
 - **Head-of-line blocking** (single control channel): flow control from the first render PR; never block the UI thread on a `%begin/%end` round trip.
 - **Self-echo double-apply / oscillation:** idempotent diff-apply + command-number tagging.
-- **Ordering:** single wire-ordered apply; a resize barriers that pane's later output.
+- **Ordering:** single wire-ordered apply; a resize acts as a barrier for that pane's later output.
 - **Non-UTF-8 / empty-line detach:** byte-oriented parser; serializer rejects bare newlines.
 - **Lock inversion (model vs UI):** one documented lock order; layout mutations on the UI queue.
 - **`window-size` side effects:** prefer per-window `refresh-client -C @win:WxH`; avoid mutating the persistent `window-size` option; render the gray-margin state rather than stretch.
@@ -83,7 +83,7 @@ One global order: never acquire a `TerminalModel` lock while holding a `PaneGrou
 - **Unit:** gateway framing/escaping incl. a lone `0x80`–`0xFF` byte in `%output`; a proof that no input sequence yields a bare newline on the control fd; layout parse+emit incl. `e123,204x53,0,0{102x53,0,0,1,101x53,103,0[101x26,103,0,2,101x26,103,27,3]}`; query-response routing; unknown-pane buffering; self-echo idempotency.
 - **Fixture/transcript tests (CI-safe, no live tmux):** replay recorded `%`-streams through gateway+controller and assert the tab/split tree, pane contents, and the seed↔live-`%output` boundary (no duplicate/missing line). Mirrors `app/src/terminal/ref_tests/data/tmux_htop`. CI has no `tmux` binary, so these are the primary protocol tests.
 - **Integration (`crates/integration/`, gated on tmux ≥3.2):** drive real `tmux -CC`; assert attach, `%layout-change` splits, write-back round-trips, reattach with a running TUI (repaint, no garble), flood-without-freeze, `%exit` teardown. Skips cleanly where tmux is absent.
-- **CI:** `./script/presubmit` (fmt + clippy `-D warnings` + nextest) green; `CHANGELOG-NEW-FEATURE` line; screen-recording proof.
+- **CI (implementation PRs):** `./script/presubmit` (fmt + clippy `-D warnings` + nextest) green; a `CHANGELOG-NEW-FEATURE` line on the PRs that ship user-facing code; screen-recording proof. This spec-only PR carries `CHANGELOG-NONE`.
 
 ## Follow-ups
 
