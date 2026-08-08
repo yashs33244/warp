@@ -1338,14 +1338,29 @@ esac
     fi
   fi
 
-    precmd_functions+=(warp_precmd)
-    preexec_functions+=(warp_preexec)
+    case " ${precmd_functions[*]-} " in
+        *" warp_precmd "*) ;;
+        *) precmd_functions+=(warp_precmd) ;;
+    esac
+    case " ${preexec_functions[*]-} " in
+        *" warp_preexec "*) ;;
+        *) preexec_functions+=(warp_preexec) ;;
+    esac
 
-    precmd_functions+=(warp_set_title_idle_on_precmd)
-    preexec_functions+=(warp_set_title_active_on_preexec)
+    case " ${precmd_functions[*]-} " in
+        *" warp_set_title_idle_on_precmd "*) ;;
+        *) precmd_functions+=(warp_set_title_idle_on_precmd) ;;
+    esac
+    case " ${preexec_functions[*]-} " in
+        *" warp_set_title_active_on_preexec "*) ;;
+        *) preexec_functions+=(warp_set_title_active_on_preexec) ;;
+    esac
 
     if declare -f user_prompt_command 2>&1 >/dev/null; then
-        precmd_functions+=(user_prompt_command)
+        case " ${precmd_functions[*]-} " in
+            *" user_prompt_command "*) ;;
+            *) precmd_functions+=(user_prompt_command) ;;
+        esac
     fi
 
     WARP_BOOTSTRAPPED=1
