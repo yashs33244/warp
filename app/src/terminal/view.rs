@@ -497,6 +497,8 @@ use crate::terminal::warpify::SubshellSource;
 use crate::terminal::warpify::render::render_subshell_separator;
 use crate::terminal::warpify::settings::WarpifySettings;
 use crate::terminal::waterfall_gap_element::WaterfallGapElement;
+#[cfg(not(target_family = "wasm"))]
+use crate::terminal::writeable_pty::bootstrap_file::TempBootstrapFile;
 use crate::terminal::writeable_pty::{PtyIntent, PtyIntentEvent, TerminalSurface};
 use crate::terminal::{
     AudibleBell, BlockListSettings, BlockListSettingsChangedEvent, CellSizeAndWindowPadding,
@@ -2624,6 +2626,13 @@ pub struct TerminalView {
     /// Whether this adopted pane's shell has been warpified. Mirrors the model
     /// flag, kept on the view so menu building never re-locks the model.
     tmux_warpified: bool,
+    /// Holds the temp file whose path a warpifying tmux pane sources, keeping it
+    /// on disk until the shell has read it (dropped on bootstrap confirm/fail).
+    /// Sourcing a short path instead of typing the multi-KB body keeps the
+    /// script out of the pane and off the tmux window name. See
+    /// [`Self::write_adopted_bootstrap_via_source_file`].
+    #[cfg(not(target_family = "wasm"))]
+    adopted_bootstrap_file: Option<TempBootstrapFile>,
     focus_handle: Option<PaneFocusHandle>,
 
     sessions: ModelHandle<Sessions>,
@@ -4340,6 +4349,8 @@ impl TerminalView {
             pane_configuration,
             tmux: None,
             tmux_warpified: false,
+            #[cfg(not(target_family = "wasm"))]
+            adopted_bootstrap_file: None,
             focus_handle: None,
             sessions,
             remote_server_shimmer_handle: ShimmeringTextStateHandle::new(),
@@ -9846,10 +9857,6 @@ impl TerminalView {
         if let Some(tmux) = &self.tmux {
             tmux.mark_warpified();
             self.tmux_warpified = true;
-            // A shell warpified in an earlier attach still has WARP_BOOTSTRAPPED
-            // set, which turns the bootstrap script into a no-op: no new
-            // handshake, no new session id, and its stale-id DCS hooks are
-            // rejected forever. Clear the guard so the handshake re-runs.
             // Hide the block up front so the injected script never renders;
             // the bootstrap-failed timer unhides it if the shell never answers.
             let show_debug_block = BlockVisibilitySettings::as_ref(ctx)
@@ -9858,19 +9865,20 @@ impl TerminalView {
             if !show_debug_block {
                 self.update_long_running_ssh_block_with_lock(|block| block.hide());
             }
-            // Turn off terminal echo first: the multi-KB bootstrap body is typed
-            // into the pane's shell, which would otherwise echo every line back.
-            // A warpified pane types through Warp's own input editor, so the
-            // shell never needs to echo again; the failed-bootstrap timer turns
-            // it back on if the handshake never completes.
-            self.write_to_pty(b" stty -echo 2>/dev/null\r".to_vec(), ctx);
-            // Branches on FISH_VERSION because fish has no `unset` builtin;
-            // neither branch runs an unknown command in any shell.
-            self.write_to_pty(
-                b" [ -n \"$FISH_VERSION\" ] && set -e WARP_BOOTSTRAPPED 2>/dev/null; [ -z \"$FISH_VERSION\" ] && unset WARP_BOOTSTRAPPED\r"
-                    .to_vec(),
-                ctx,
-            );
+            // A shell warpified in an earlier attach still has WARP_BOOTSTRAPPED
+            // set, which turns the bootstrap into a no-op (no new handshake, no
+            // new session id, stale-id DCS hooks rejected forever). The
+            // shell-detection (unknown) pass is typed in, so clear the guard
+            // inline for it; the known-shell pass carries the clear inside the
+            // file it sources, so it needs nothing here. Branches on
+            // FISH_VERSION because fish has no `unset` builtin.
+            if shell_type.is_none() {
+                self.write_to_pty(
+                    b" [ -n \"$FISH_VERSION\" ] && set -e WARP_BOOTSTRAPPED 2>/dev/null; [ -z \"$FISH_VERSION\" ] && unset WARP_BOOTSTRAPPED\r"
+                        .to_vec(),
+                    ctx,
+                );
+            }
         }
 
         self.write_init_subshell_bytes_to_pty(shell_type, ctx);
@@ -13698,11 +13706,17 @@ impl TerminalView {
 
         // An adopted (tmux) pane joins Warp's block UI only now, on the
         // shell's own confirmation - never on the injection attempt.
-        {
+        let is_adopted = {
             let mut model = self.model.lock();
-            if model.is_adopted_pane() {
+            let is_adopted = model.is_adopted_pane();
+            if is_adopted {
                 model.set_adopted_pane_warpified();
             }
+            is_adopted
+        };
+        if is_adopted {
+            // The shell has read the sourced file; it is safe to delete now.
+            self.clear_adopted_bootstrap_file();
         }
 
         // Ensure that the new session's working directory and environment are persisted.
@@ -15244,12 +15258,86 @@ impl TerminalView {
     ) {
         let session_id = crate::terminal::bootstrap::generate_session_id();
         self.model.lock().register_session_id(session_id);
-        self.clear_line_editor_and_write_to_pty(
-            init_subshell_command(shell_type, &self.env_vars, session_id, ctx).into_bytes(),
-            ctx,
-        );
+        let command =
+            init_subshell_command(shell_type, &self.env_vars, session_id, ctx).into_bytes();
+
+        // An adopted tmux pane mirrors a shell already sitting at an interactive
+        // prompt, so typing the (multi-KB) bootstrap body in echoes it line by
+        // line and renames the tmux window to the command. Write it to a temp
+        // file and source the short path instead - the same out-of-band trick
+        // the owned-shell path uses. Needs a known shell (to pick the source
+        // syntax) and a readable temp file; anything else falls back to the
+        // plain inline write below.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let is_adopted = self.model.lock().is_adopted_pane();
+            if let Some(shell_type) = shell_type
+                && is_adopted
+                && self.write_adopted_bootstrap_via_source_file(&command, shell_type, ctx)
+            {
+                return;
+            }
+        }
+
+        self.clear_line_editor_and_write_to_pty(command, ctx);
         self.write_to_pty(vec![escape_sequences::C0::CR], ctx);
     }
+
+    /// Deliver an adopted tmux pane's bootstrap body out-of-band: write it to a
+    /// temp file and source that file with one short command, so the body is
+    /// never echoed into the pane and never becomes the tmux window name. The
+    /// file is kept on `self` until the shell has read it (dropped on bootstrap
+    /// confirm or failure). Returns whether the out-of-band write was issued; a
+    /// `false` return tells the caller to fall back to typing the body in.
+    #[cfg(not(target_family = "wasm"))]
+    fn write_adopted_bootstrap_via_source_file(
+        &mut self,
+        command: &[u8],
+        shell_type: ShellType,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        // Clear the guard a shell warpified in an earlier attach still carries so
+        // the bootstrap re-runs, then the (self-guarded) command body.
+        let mut script: Vec<u8> = match shell_type {
+            ShellType::Fish => b"set -e WARP_BOOTSTRAPPED 2>/dev/null\n".to_vec(),
+            _ => b"unset WARP_BOOTSTRAPPED 2>/dev/null\n".to_vec(),
+        };
+        script.extend_from_slice(command);
+        script.push(b'\n');
+
+        let Ok(file) = TempBootstrapFile::new(tempfile::Builder::new(), &script) else {
+            return false;
+        };
+        let Some(path) = file.path_as_bytes() else {
+            return false;
+        };
+
+        // Only this short `source '<path>'` echoes; the body stays in the file.
+        // A leading space keeps it out of history; single quotes guard the path
+        // (a temp path never contains a single quote).
+        let source_kw: &[u8] = match shell_type {
+            ShellType::PowerShell => b" . '",
+            _ => b" source '",
+        };
+        let mut source_cmd = Vec::with_capacity(source_kw.len() + path.len() + 1);
+        source_cmd.extend_from_slice(source_kw);
+        source_cmd.extend_from_slice(&path);
+        source_cmd.push(b'\'');
+        self.clear_line_editor_and_write_to_pty(source_cmd, ctx);
+        self.write_to_pty(vec![escape_sequences::C0::CR], ctx);
+
+        self.adopted_bootstrap_file = Some(file);
+        true
+    }
+
+    /// Drop the temp file a warpifying tmux pane sourced. No-op off desktop.
+    #[cfg(not(target_family = "wasm"))]
+    fn clear_adopted_bootstrap_file(&mut self) {
+        self.adopted_bootstrap_file = None;
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn clear_adopted_bootstrap_file(&mut self) {}
 
     /// If a command correction exists, generate the command correction banner.
     fn after_command_correction_generation(
@@ -16184,9 +16272,9 @@ impl TerminalView {
         if self.model.lock().is_adopted_pane() {
             if self.sessions.as_ref(ctx).is_empty() && self.tmux_warpified {
                 self.tmux_warpified = false;
-                // Restore the echo we turned off before injecting, so the raw
-                // pane shows the user's typing again.
-                self.write_to_pty(b" stty echo 2>/dev/null\r".to_vec(), ctx);
+                // The handshake never landed, so the sourced file is dead
+                // weight; drop it (deletes the temp file).
+                self.clear_adopted_bootstrap_file();
                 // The script block was hidden at injection; without an unhide
                 // every later byte of shell output would render into a hidden
                 // block and the pane would look dead.
