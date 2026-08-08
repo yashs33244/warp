@@ -12,7 +12,7 @@ use crate::pane_group::TerminalViewResources;
 use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::model::session::Sessions;
 use crate::terminal::model_events::ModelEventDispatcher;
-use crate::terminal::shell::{ShellName, ShellType};
+use crate::terminal::shell::ShellName;
 use crate::terminal::terminal_manager::BlockSpacing;
 use crate::terminal::{
     ShellLaunchState, TerminalManager, TerminalModel, TerminalView, terminal_manager,
@@ -55,10 +55,12 @@ impl TmuxTerminalManager {
             None, /* restored_blocks */
             initial_size,
             channel_event_proxy.clone(),
-            ShellLaunchState::ShellSpawned {
+            // The shell inside a tmux pane is already running and its type is
+            // not known here (it is learned only if/when the pane is warpified),
+            // so start in DeterminingShell rather than mislabeling it as zsh.
+            ShellLaunchState::DeterminingShell {
                 available_shell: None,
                 display_name: ShellName::blank(),
-                shell_type: ShellType::Zsh,
             },
             BlockSpacing::for_gui(ctx),
             ctx,
