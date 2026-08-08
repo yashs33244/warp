@@ -2259,3 +2259,63 @@ fn cloud_mode_setup_phase_ended_does_not_emit_when_not_sharing() {
     let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(events.is_empty());
 }
+
+// A zombie-warpified tmux pane emits a stale-session Precmd on every prompt.
+// The rewarpify signal must fire at most once per attach, otherwise a re-inject
+// that never confirms is retried on the next prompt forever (an echo storm that
+// locks the pane). The cap is the "acted on" latch: consuming the signal is
+// pure, so a signal dropped before it reaches the trigger does not burn the
+// attempt; only actually triggering the bootstrap latches it.
+#[test]
+fn adopted_pane_rewarpify_signal_fires_at_most_once() {
+    let mut terminal = TerminalModel::mock(None, None);
+    terminal.set_adopted_pane();
+
+    // A stale Precmd raises the signal, and consuming it does NOT latch: the
+    // signal can be raised again if the first was never acted on (e.g. dropped
+    // in a pre-adoption buffer flush).
+    terminal.on_unregistered_session_hook("Precmd");
+    assert!(terminal.take_adopted_stale_precmd());
+    terminal.on_unregistered_session_hook("Precmd");
+    assert!(terminal.take_adopted_stale_precmd());
+
+    // Once the rewarpify is actually triggered, every later stale Precmd is
+    // ignored - the single automatic attempt is spent.
+    terminal.mark_adopted_rewarpify_attempted();
+    for _ in 0..5 {
+        terminal.on_unregistered_session_hook("Precmd");
+        assert!(!terminal.take_adopted_stale_precmd());
+    }
+}
+
+// Guard (non-regression) tests: these assert the pre-existing arming conditions,
+// distinct from the one-attempt cap proven above.
+// A non-Precmd hook, or a hook on a pane Warp owns, must never arm rewarpify.
+#[test]
+fn rewarpify_signal_ignores_non_precmd_and_non_adopted() {
+    let mut adopted = TerminalModel::mock(None, None);
+    adopted.set_adopted_pane();
+    adopted.on_unregistered_session_hook("Preexec");
+    assert!(!adopted.take_adopted_stale_precmd());
+
+    let mut owned = TerminalModel::mock(None, None);
+    owned.on_unregistered_session_hook("Precmd");
+    assert!(!owned.take_adopted_stale_precmd());
+}
+
+// A pane already flipped back into Warp's block UI (warpified) must not re-arm
+// on a late stale hook, and the explicit latch call has the same effect.
+#[test]
+fn rewarpify_signal_suppressed_after_warpify_or_latch() {
+    let mut warpified = TerminalModel::mock(None, None);
+    warpified.set_adopted_pane();
+    warpified.set_adopted_pane_warpified();
+    warpified.on_unregistered_session_hook("Precmd");
+    assert!(!warpified.take_adopted_stale_precmd());
+
+    let mut latched = TerminalModel::mock(None, None);
+    latched.set_adopted_pane();
+    latched.mark_adopted_rewarpify_attempted();
+    latched.on_unregistered_session_hook("Precmd");
+    assert!(!latched.take_adopted_stale_precmd());
+}

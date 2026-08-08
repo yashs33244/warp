@@ -408,6 +408,14 @@ pub struct TerminalModel {
     /// bootstrap is safe.
     adopted_stale_precmd: bool,
 
+    /// Latched once this attach has actually triggered a re-warpify of the
+    /// adopted pane (the bootstrap was injected). A zombie-warpified shell emits
+    /// a stale-session Precmd on *every* prompt, so without this latch a failed
+    /// re-inject would be retried on the next prompt forever (an echo storm that
+    /// locks the pane). One automatic attempt per attach; on failure the pane
+    /// stays raw with the warpify banner and the user can retry by hand.
+    adopted_rewarpify_attempted: bool,
+
     /// Stack of saved window titles. When a title is popped from this stack, the `title` for the
     /// term is set.
     title_stack: Vec<Option<String>>,
@@ -1087,6 +1095,7 @@ impl TerminalModel {
             is_adopted_pane: false,
             adopted_pane_warpified: false,
             adopted_stale_precmd: false,
+            adopted_rewarpify_attempted: false,
             title_stack: Vec::new(),
             title: None,
             custom_title: None,
@@ -2043,9 +2052,21 @@ impl TerminalModel {
         self.adopted_pane_warpified = true;
     }
 
-    /// Consume the stale-Precmd signal (see `adopted_stale_precmd`).
+    /// Consume the stale-Precmd signal (see `adopted_stale_precmd`). Pure: the
+    /// one-attempt latch is set when the rewarpify is actually *acted on*
+    /// (`mark_adopted_rewarpify_attempted`), not here, so a signal that is
+    /// consumed but dropped before it reaches the trigger (e.g. a buffered
+    /// pre-adoption flush) does not silently burn the attempt.
     pub fn take_adopted_stale_precmd(&mut self) -> bool {
         std::mem::take(&mut self.adopted_stale_precmd)
+    }
+
+    /// Latch that this attach has already triggered re-warpify for the adopted
+    /// pane, so repeated stale-session Precmd hooks can't retrigger the
+    /// bootstrap. Called from every warpify entry point (auto and manual) for
+    /// adopted panes, at the point the bootstrap is actually injected.
+    pub fn mark_adopted_rewarpify_attempted(&mut self) {
+        self.adopted_rewarpify_attempted = true;
     }
 
     pub fn set_pending_shell_launch_data(&mut self, shell_launch_data: ShellLaunchData) {
@@ -2627,8 +2648,15 @@ impl ansi::Handler for TerminalModel {
     fn on_unregistered_session_hook(&mut self, hook_name: &str) {
         // A zombie-warpified shell (bootstrapped in an earlier attach) emits
         // Precmd exactly when it is back at its prompt - the safe moment to
-        // re-run the bootstrap handshake.
-        if hook_name == "Precmd" && self.is_adopted_pane && !self.adopted_pane_warpified {
+        // re-run the bootstrap handshake. It emits one on *every* prompt, so
+        // `adopted_rewarpify_attempted` caps this to a single automatic attempt:
+        // without it a failed re-inject would fire again on the next prompt,
+        // forever.
+        if hook_name == "Precmd"
+            && self.is_adopted_pane
+            && !self.adopted_pane_warpified
+            && !self.adopted_rewarpify_attempted
+        {
             self.adopted_stale_precmd = true;
         }
     }

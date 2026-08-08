@@ -9816,7 +9816,14 @@ impl TerminalView {
         // actually confirms subshell bootstrap is in progress.
         // If the remote never emits InitShell, the block stays visible.
         {
-            let model = self.model.lock();
+            let mut model = self.model.lock();
+            // One warpify attempt per attach: latch here so a zombie shell that
+            // re-emits a stale-session Precmd on every prompt can't retrigger an
+            // endless re-inject loop. A failed attempt leaves the pane raw with
+            // the banner, and a manual retry re-enters this same path.
+            if model.is_adopted_pane() {
+                model.mark_adopted_rewarpify_attempted();
+            }
             // Adopted (tmux) panes record unconditionally: their block is
             // created moments before bootstrap fires, so it is never
             // long-running yet, and without the record the injected script
