@@ -810,6 +810,9 @@ impl PaneConfiguration {
         show_accent_border: bool,
         ctx: &mut ModelContext<Self>,
     ) {
+        if self.show_accent_border == show_accent_border {
+            return;
+        }
         self.show_accent_border = show_accent_border;
         ctx.emit(PaneConfigurationEvent::ShowAccentBorderUpdated);
     }

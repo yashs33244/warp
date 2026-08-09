@@ -6,47 +6,215 @@
 
 use warp_terminal::tmux::command;
 
+use super::geometry::TmuxGeometry;
 use crate::terminal::writeable_pty::Message;
 use crate::terminal::writeable_pty::pty_controller::{EventLoopSendError, EventLoopSender};
 
+/// Payload bytes per `send-keys`. tmux rejects an over-long command outright
+/// (empirically somewhere past 4 KB of hex on 3.5a), and each byte costs three
+/// characters of hex, so 1 KiB per command stays comfortably inside the limit.
+const MAX_SEND_KEYS_BYTES: usize = 1024;
+
+/// Bounds on a grid we will ask tmux for, so a degenerate pixel size cannot turn
+/// into an absurd window.
+const MIN_GRID: u32 = 1;
+const MAX_GRID: u32 = 2000;
+
 /// Turns a pane's `TerminalView` messages into control-mode command bytes.
 pub struct TmuxInputSender {
+    window: u32,
     pane: u32,
+    /// Shared with the control-stream reader, which keeps it current from
+    /// tmux's layout notifications.
+    geometry: TmuxGeometry,
     control_tx: async_channel::Sender<Vec<u8>>,
 }
 
 impl TmuxInputSender {
-    pub fn new(pane: u32, control_tx: async_channel::Sender<Vec<u8>>) -> Self {
-        Self { pane, control_tx }
+    pub fn new(
+        window: u32,
+        pane: u32,
+        geometry: TmuxGeometry,
+        control_tx: async_channel::Sender<Vec<u8>>,
+    ) -> Self {
+        Self {
+            window,
+            pane,
+            geometry,
+            control_tx,
+        }
     }
 
-    /// Command bytes for a message, or `None` when it produces nothing to send
-    /// (empty input, or a lifecycle message with no tmux equivalent).
-    fn command_for(&self, message: Message) -> Option<Vec<u8>> {
+    /// Commands for a message; empty when it produces nothing to send (empty
+    /// input, or a lifecycle message with no tmux equivalent).
+    fn commands_for(&self, message: Message) -> Vec<Vec<u8>> {
         match message {
             // Every keystroke goes through `send-keys -H` (hex), the only input
             // path that can never inject a literal newline into the payload.
-            Message::Input(bytes) => command::send_keys_hex(self.pane, &bytes).ok(),
-            // A resize maps to the control client's size; tmux re-lays the panes
-            // to fit. `command::resize_pane` is available for per-pane sizing.
-            Message::Resize(size) => Some(command::refresh_client_size(
-                size.columns() as u32,
-                size.rows() as u32,
-            )),
-            Message::Shutdown | Message::ChildExited => None,
+            // Split into chunks: tmux rejects an over-long command outright, and
+            // a payload like Warp's shell-bootstrap script is far past the
+            // limit, so sending it whole would silently type nothing.
+            Message::Input(bytes) => bytes
+                .chunks(MAX_SEND_KEYS_BYTES)
+                .filter_map(|chunk| command::send_keys_hex(self.pane, chunk).ok())
+                .collect(),
+            Message::Resize(size) => self
+                .resize_command(size.columns() as u32, size.rows() as u32)
+                .into_iter()
+                .collect(),
+            Message::Shutdown | Message::ChildExited => Vec::new(),
         }
     }
+
+    /// Ask tmux to make this pane's *window* the size at which this pane lands
+    /// on a `cols` x `rows` grid, keeping the other panes' share of the window.
+    /// Without this tmux keeps wrapping output at its own idea of the pane
+    /// width, which renders as duplicated and clipped lines.
+    ///
+    /// Only the per-window form is ever sent: a bare `refresh-client -C` resizes
+    /// every window in the session and `resize-pane` re-lays out panes the user
+    /// sized themselves, so either one turns "attach" into "overwrite my
+    /// layout".
+    fn resize_command(&self, cols: u32, rows: u32) -> Option<Vec<u8>> {
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let (win_cols, win_rows) = match self.geometry.get(self.pane) {
+            Some(geometry) if geometry.pane_cols > 0 && geometry.pane_rows > 0 => (
+                scale(cols, geometry.win_cols, geometry.pane_cols),
+                scale(rows, geometry.win_rows, geometry.pane_rows),
+            ),
+            // No layout seen yet: the pane is all we know of the window.
+            _ => (clamp_grid(cols), clamp_grid(rows)),
+        };
+        self.geometry
+            .should_send(self.window, win_cols, win_rows)
+            .then(|| command::refresh_client_window_size(self.window, win_cols, win_rows))
+    }
+}
+
+/// `value * numerator / denominator`, rounded to the nearest cell. Widened to
+/// `u64` so no grid can overflow the multiply. `denominator` is non-zero.
+fn scale(value: u32, numerator: u32, denominator: u32) -> u32 {
+    let denominator = denominator as u64;
+    let scaled = (value as u64 * numerator as u64 + denominator / 2) / denominator;
+    clamp_grid(scaled.min(u32::MAX as u64) as u32)
+}
+
+fn clamp_grid(cells: u32) -> u32 {
+    cells.clamp(MIN_GRID, MAX_GRID)
 }
 
 impl EventLoopSender for TmuxInputSender {
     fn send(&self, message: Message) -> Result<(), EventLoopSendError> {
-        let Some(bytes) = self.command_for(message) else {
-            return Ok(());
-        };
-        self.control_tx.try_send(bytes).map_err(|err| match err {
-            async_channel::TrySendError::Closed(_) => EventLoopSendError::Disconnected,
-            async_channel::TrySendError::Full(_) => EventLoopSendError::Other(err.into()),
-        })
+        for bytes in self.commands_for(message) {
+            self.control_tx.try_send(bytes).map_err(|err| match err {
+                async_channel::TrySendError::Closed(_) => EventLoopSendError::Disconnected,
+                async_channel::TrySendError::Full(_) => EventLoopSendError::Other(err.into()),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Sends a pane's emulator-generated replies (DSR/DA cursor-position answers and
+/// other query responses) back to tmux as `send-keys` input, so full-screen apps
+/// that interrogate the terminal receive their answer instead of hanging.
+///
+/// Separate from [`TmuxInputSender`] because a sink emits raw response bytes
+/// rather than [`Message`]s, and the two live on opposite sides of the control
+/// stream (input path vs. output path) while sharing the same write channel.
+pub struct TmuxResponder {
+    pane: u32,
+    control_tx: async_channel::Sender<Vec<u8>>,
+}
+
+impl TmuxResponder {
+    pub fn new(pane: u32, control_tx: async_channel::Sender<Vec<u8>>) -> Self {
+        Self { pane, control_tx }
+    }
+
+    /// Forward `bytes` (the emulator's reply) to the pane via `send-keys -H`.
+    /// Empty replies and a closed control stream are silently ignored — a
+    /// dropped response only costs a redraw, never correctness.
+    pub fn send_response(&self, bytes: &[u8]) {
+        if let Ok(command) = command::send_keys_hex(self.pane, bytes) {
+            let _ = self.control_tx.try_send(command);
+        }
+    }
+}
+
+/// The tmux commands a single adopted pane can issue on the user's behalf
+/// (split, kill, detach, rename), addressed at that pane and its window.
+///
+/// Every send is best-effort: tmux is the source of truth and re-syncs the tab
+/// through its notifications, so a dropped command costs a click, never
+/// correctness.
+#[derive(Clone)]
+pub struct TmuxPaneCommands {
+    window: u32,
+    pane: u32,
+    control_tx: async_channel::Sender<Vec<u8>>,
+}
+
+impl TmuxPaneCommands {
+    pub fn new(window: u32, pane: u32, control_tx: async_channel::Sender<Vec<u8>>) -> Self {
+        Self {
+            window,
+            pane,
+            control_tx,
+        }
+    }
+
+    pub fn pane(&self) -> u32 {
+        self.pane
+    }
+
+    /// `split-window -h` (left-right) or `-v` (top-bottom).
+    pub fn split(&self, horizontal: bool) {
+        self.send(command::split_window(self.pane, horizontal));
+    }
+
+    pub fn kill_pane(&self) {
+        self.send(command::kill_pane(self.pane));
+    }
+
+    pub fn kill_window(&self) {
+        self.send(command::kill_window(self.window));
+    }
+
+    pub fn detach(&self) {
+        self.send(command::detach_client());
+    }
+
+    pub fn new_window(&self) {
+        self.send(command::new_window());
+    }
+
+    pub fn select(&self) {
+        self.send(command::select_pane(self.pane));
+    }
+
+    /// No-op for a name that is empty once unsafe characters are stripped.
+    pub fn rename_window(&self, name: &str) {
+        if let Ok(bytes) = command::rename_window(self.window, name) {
+            self.send(bytes);
+        }
+    }
+
+    /// Record in tmux itself that this pane has been warpified, so the choice
+    /// survives detaching and outlives the Warp process.
+    pub fn mark_warpified(&self) {
+        self.send(command::set_pane_warpified(self.pane));
+    }
+
+    /// Send an already-serialized control command for this pane's session.
+    pub fn send_raw(&self, bytes: Vec<u8>) {
+        self.send(bytes);
+    }
+
+    fn send(&self, bytes: Vec<u8>) {
+        let _ = self.control_tx.try_send(bytes);
     }
 }
 

@@ -887,6 +887,12 @@ pub enum WorkspaceAction {
     },
     /// Shows (toggles) the team-switcher dropdown menu in the title bar.
     ShowTeamSwitcherMenu,
+    /// Starts a `tmux -CC` control-mode session and mirrors its windows as
+    /// native tabs. Gated on [`crate::terminal::tmux_tty::is_enabled`]; the
+    /// actual attach is deferred to a global action so it runs after the
+    /// workspace view update completes.
+    AttachTmuxControlMode,
+    ManageTmuxSessions,
 }
 
 impl From<&WorkspaceAction> for LoginGatedFeature {
@@ -1210,7 +1216,9 @@ impl WorkspaceAction {
             | OpenCreateAuthSecretModal { .. }
             | OpenNetworkLogPane
             | OpenNewWindowForTeam { .. }
-            | ShowTeamSwitcherMenu => false,
+            | ShowTeamSwitcherMenu
+            | AttachTmuxControlMode
+            | ManageTmuxSessions => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

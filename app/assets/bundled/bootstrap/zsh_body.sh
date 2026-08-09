@@ -1145,8 +1145,10 @@ esac
 
   # Add the Warp title precmd functions before the bootstrap sequence is sourced so that a user's custom tab title
   # behavior is respected over Warp's.
-  precmd_functions+=(warp_set_title_idle_on_precmd)
-  preexec_functions+=(warp_set_title_active_on_preexec)
+  if (( ! ${precmd_functions[(Ie)warp_set_title_idle_on_precmd]:-0} )); then
+    precmd_functions+=(warp_set_title_idle_on_precmd)
+    preexec_functions+=(warp_set_title_active_on_preexec)
+  fi
 
   # Clean up after ourselves, restore ZDOTDIR, and remove the temporary directory in the ssh case.
   # We need to do this before the rcfiles are sourced, since rcfiles can reference ZDOTDIR.
@@ -1320,8 +1322,10 @@ esac
   # https://github.com/warpdotdev/warp/issues/11520
   zle -A .bracketed-paste bracketed-paste
 
-  precmd_functions+=(warp_precmd warp_update_prompt_vars)
-  preexec_functions+=(warp_preexec)
+  if (( ! ${precmd_functions[(Ie)warp_precmd]:-0} )); then
+    precmd_functions+=(warp_precmd warp_update_prompt_vars)
+    preexec_functions+=(warp_preexec)
+  fi
 
   WARP_BOOTSTRAPPED=1
 

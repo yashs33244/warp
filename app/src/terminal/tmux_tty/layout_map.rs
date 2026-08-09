@@ -9,7 +9,9 @@
 
 use warp_terminal::tmux::layout::{LayoutNode, SplitDir, Window};
 
+use super::lifecycle::pane_ids;
 use crate::app_state::{BranchSnapshot, LeafSnapshot, PaneFlex, PaneNodeSnapshot, SplitDirection};
+use crate::pane_group::Direction;
 
 /// tmux `{}` (left-right) maps to Warp `Horizontal`; tmux `[]` (top-bottom)
 /// maps to Warp `Vertical`.
@@ -84,13 +86,22 @@ pub enum TmuxPaneTree<T> {
 /// `make_leaf` is `FnMut` (unlike [`map_window`]'s `Fn`) so a caller may create
 /// one pane manager per leaf — a side-effecting op that mutates the app context.
 /// It is invoked in tmux's left-to-right, depth-first pane order.
-pub fn map_window_to<T>(window: &Window, make_leaf: &mut impl FnMut(u32) -> T) -> TmuxPaneTree<T> {
+/// `make_leaf` receives the pane id plus the columns and rows tmux laid that
+/// pane out at, so the adopted pane's grid can start at tmux's geometry instead
+/// of a size Warp invented.
+pub fn map_window_to<T>(
+    window: &Window,
+    make_leaf: &mut impl FnMut(u32, u32, u32) -> T,
+) -> TmuxPaneTree<T> {
     map_node_to(&window.root, make_leaf)
 }
 
-fn map_node_to<T>(node: &LayoutNode, make_leaf: &mut impl FnMut(u32) -> T) -> TmuxPaneTree<T> {
+fn map_node_to<T>(
+    node: &LayoutNode,
+    make_leaf: &mut impl FnMut(u32, u32, u32) -> T,
+) -> TmuxPaneTree<T> {
     match node {
-        LayoutNode::Leaf { pane, .. } => TmuxPaneTree::Leaf(make_leaf(*pane)),
+        LayoutNode::Leaf { pane, w, h, .. } => TmuxPaneTree::Leaf(make_leaf(*pane, *w, *h)),
         LayoutNode::Split { dir, children, .. } => {
             let mut mapped = Vec::with_capacity(children.len());
             for child in children {
@@ -103,6 +114,99 @@ fn map_node_to<T>(node: &LayoutNode, make_leaf: &mut impl FnMut(u32) -> T) -> Tm
             }
         }
     }
+}
+
+/// Where a pane belongs relative to a pane Warp has already adopted: the pane
+/// to split off, and the side the new pane lands on.
+#[derive(Debug, Clone, Copy)]
+pub struct PanePlacement {
+    pub base: u32,
+    pub direction: Direction,
+}
+
+/// Work out how to splice `pane` into the tab Warp already renders for this
+/// window, given `is_adopted` naming the panes that tab holds.
+///
+/// Walks outwards from the split `pane` sits in, so a pane added inside a
+/// freshly created nested split still finds an adopted neighbour to attach to.
+/// Returns `None` when no adopted pane remains to split off.
+pub fn placement_for_pane(
+    window: &Window,
+    pane: u32,
+    is_adopted: &impl Fn(u32) -> bool,
+) -> Option<PanePlacement> {
+    let mut path = Vec::new();
+    if !find_split_path(&window.root, pane, &mut path) {
+        return None;
+    }
+    for (split, idx) in path {
+        let LayoutNode::Split { dir, children, .. } = split else {
+            continue;
+        };
+        // Prefer a neighbour ahead of the pane so the new pane keeps the side
+        // tmux put it on; fall back to one after it.
+        for sibling in children[..idx].iter().rev() {
+            if let Some(base) = pane_ids(sibling).into_iter().rev().find(|p| is_adopted(*p)) {
+                return Some(PanePlacement {
+                    base,
+                    direction: side(*dir, true),
+                });
+            }
+        }
+        for sibling in &children[idx + 1..] {
+            if let Some(base) = pane_ids(sibling).into_iter().find(|p| is_adopted(*p)) {
+                return Some(PanePlacement {
+                    base,
+                    direction: side(*dir, false),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The side of a split axis a pane lands on: `after` is right of a left-right
+/// split and below a top-bottom one.
+fn side(dir: SplitDir, after: bool) -> Direction {
+    match (dir, after) {
+        (SplitDir::Horizontal, true) => Direction::Right,
+        (SplitDir::Horizontal, false) => Direction::Left,
+        (SplitDir::Vertical, true) => Direction::Down,
+        (SplitDir::Vertical, false) => Direction::Up,
+    }
+}
+
+/// Push the splits enclosing `pane` onto `path`, innermost first, each paired
+/// with the index of the child the pane lives under.
+fn find_split_path<'a>(
+    node: &'a LayoutNode,
+    pane: u32,
+    path: &mut Vec<(&'a LayoutNode, usize)>,
+) -> bool {
+    match node {
+        LayoutNode::Leaf { pane: id, .. } => *id == pane,
+        LayoutNode::Split { children, .. } => {
+            for (idx, child) in children.iter().enumerate() {
+                if find_split_path(child, pane, path) {
+                    path.push((node, idx));
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// The columns and rows tmux laid `pane` out at, or `None` when the window's
+/// layout does not contain it.
+pub fn pane_grid_size(window: &Window, pane: u32) -> Option<(u32, u32)> {
+    fn find(node: &LayoutNode, pane: u32) -> Option<(u32, u32)> {
+        match node {
+            LayoutNode::Leaf { pane: id, w, h, .. } => (*id == pane).then_some((*w, *h)),
+            LayoutNode::Split { children, .. } => children.iter().find_map(|c| find(c, pane)),
+        }
+    }
+    find(&window.root, pane)
 }
 
 #[cfg(test)]

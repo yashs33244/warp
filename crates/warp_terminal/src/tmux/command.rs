@@ -96,6 +96,14 @@ pub fn refresh_client_size(w: u32, h: u32) -> Vec<u8> {
     fixed(format!("refresh-client -C {w},{h}"))
 }
 
+/// Size ONE window for this control-mode client, leaving the session's other
+/// windows alone (the bare client form above resizes every one of them). tmux
+/// only accepts `<w>x<h>` in the per-window form: `<w>,<h>` reports success and
+/// is then silently ignored.
+pub fn refresh_client_window_size(window: u32, w: u32, h: u32) -> Vec<u8> {
+    fixed(format!("refresh-client -C @{window}:{w}x{h}"))
+}
+
 pub fn refresh_client_pause_after(secs: u32) -> Vec<u8> {
     fixed(format!("refresh-client -f pause-after={secs}"))
 }
@@ -112,12 +120,54 @@ pub fn capture_pane(pane: u32, start: Option<i64>) -> Vec<u8> {
     fixed(cmd)
 }
 
+/// Query every window in the attached session, one per reply line, as
+/// `@<window-id> <layout>` (e.g. `@0 aafd,120x40,0,0,0`). The host parses the
+/// reply to bootstrap tabs on attach and after `%window-add`, since tmux does
+/// not emit `%layout-change` for a window that already exists at attach time.
 pub fn list_windows() -> Vec<u8> {
-    fixed("list-windows -F '#{window_layout}'".to_string())
+    fixed("list-windows -F '#{window_id} #{window_layout}'".to_string())
 }
 
 pub fn detach_client() -> Vec<u8> {
     fixed("detach-client".to_string())
+}
+
+/// Make `arg` safe to drop inside a single-quoted tmux argument: control bytes
+/// would break the one-command-per-line framing and a `'` would end the quote.
+fn quote_arg(arg: &str) -> String {
+    arg.chars()
+        .filter(|c| !c.is_control() && *c != '\'')
+        .collect()
+}
+
+/// Rejects a name that is empty once unsafe characters are stripped, since a
+/// bare `rename-window -t @n ''` is not what the user asked for.
+pub fn rename_window(window: u32, name: &str) -> Result<Vec<u8>, CommandError> {
+    let name = quote_arg(name);
+    if name.trim().is_empty() {
+        return Err(CommandError);
+    }
+    write_command(&format!("rename-window -t @{window} '{name}'"))
+}
+
+pub fn select_pane(pane: u32) -> Vec<u8> {
+    fixed(format!("select-pane -t %{pane}"))
+}
+
+pub fn kill_session() -> Vec<u8> {
+    fixed("kill-session".to_string())
+}
+
+/// The pane option Warp stores its per-pane warpified flag in. A user option
+/// (`@`-prefixed) lives in the tmux server, so it outlives the Warp process and
+/// is still there when the session is reattached.
+pub const WARPIFIED_PANE_OPTION: &str = "@warp_warpified";
+
+/// Remember that this pane's shell has been warpified.
+pub fn set_pane_warpified(pane: u32) -> Vec<u8> {
+    fixed(format!(
+        "set-option -p -t %{pane} {WARPIFIED_PANE_OPTION} 1"
+    ))
 }
 
 #[cfg(test)]
