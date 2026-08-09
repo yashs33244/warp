@@ -30,34 +30,67 @@ pub mod process;
 pub mod session;
 pub mod terminal_manager;
 
+use std::io;
+
+use warpui::{AppContext, ViewHandle};
+
 use crate::features::FeatureFlag;
+use crate::workspace::Workspace;
 
 /// Whether the tmux control-mode integration is active.
 pub fn is_enabled() -> bool {
     FeatureFlag::TmuxControlMode.is_enabled()
 }
 
-/// Attach a running `tmux -CC` control session as a new Warp tab.
+/// Attach a running `tmux -CC` control session, mirroring its windows as Warp
+/// tabs.
 ///
-/// The end-to-end path is: [`process::spawn_control_process`] launches the
-/// child and yields `control_rx`/`input_tx`; a [`session::TmuxSession`] drains
+/// The end-to-end path: [`process::spawn_control_process`] launches the child
+/// and yields `control_rx`/`input_tx`; a [`session::TmuxSession`] drains
 /// `control_rx` on an [`event_loop::TmuxEventLoop`], routing `%output` to per-
 /// pane sinks and emitting [`session::LifecycleEffect`]s for window/pane
-/// changes; the first `%layout-change` seeds the initial tab.
+/// changes. The first `%layout-change` for a window calls
+/// [`Workspace::adopt_tmux_window`], which builds one
+/// [`terminal_manager::TmuxTerminalManager`] per pane and adopts them into a tab
+/// via [`crate::pane_group::PanesLayout::AdoptedTmux`] (no shell PTY is spawned).
 ///
-/// TODO(PR4-ui): wire the tab up. This needs an `AppContext`/`WorkspaceView`
-/// (to call [`terminal_manager::TmuxTerminalManager::create_model`] per pane and
-/// `WorkspaceView::add_tab_with_pane_layout`), so `attach` will grow those
-/// parameters. It also needs a pane-adoption path that does not exist yet:
-/// `PanesLayout::Snapshot` rebuilds each `TerminalPaneSnapshot` by spawning a
-/// fresh shell PTY (see `PaneGroup::create_session`), so a `LeafSnapshot`
-/// *cannot* reference an already-created tmux-backed manager/view. Adopting the
-/// pre-built [`terminal_manager::TmuxTerminalManager`] panes into a tab requires
-/// a new `PanesLayout` variant (or a whole-tree analogue of
-/// `WorkspaceView::add_tab_from_existing_pane`) — that is the PR4 change.
-/// Gated by [`is_enabled`].
-pub fn attach() {
-    if is_enabled() {
-        // TODO(PR4-ui): wire up the control session (see above).
+/// No-op when the integration is disabled (see [`is_enabled`]).
+///
+/// TODO(PR5-ui): expose an entry point (command palette / menu) that calls this.
+pub fn attach(
+    workspace: &ViewHandle<Workspace>,
+    target: Option<&str>,
+    ctx: &mut AppContext,
+) -> io::Result<()> {
+    if !is_enabled() {
+        return Ok(());
     }
+
+    let executor = ctx.background_executor();
+    let process = process::spawn_control_process(target, executor)?;
+    let session = session::TmuxSession::new();
+    let workspace_weak = workspace.downgrade();
+
+    let event_loop = ctx.add_model(|model_ctx| {
+        event_loop::TmuxEventLoop::start(
+            session,
+            process.control_rx,
+            process.input_tx,
+            workspace_weak,
+            model_ctx,
+        )
+    });
+
+    // Retain the event-loop model (and its control-stream reader) for the
+    // workspace view's lifetime, the same ownership trick the terminal managers
+    // use: hand it to a task that never completes.
+    // TODO(PR5-teardown): drop it on `%exit` / detach instead of holding it
+    // until the workspace window closes.
+    workspace.update(ctx, |_workspace, ctx| {
+        ctx.spawn(futures::future::pending::<()>(), move |_, _, _| {
+            std::mem::drop(event_loop);
+        });
+    });
+
+    Ok(())
 }

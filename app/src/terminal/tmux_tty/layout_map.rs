@@ -65,6 +65,46 @@ fn node_extent(node: &LayoutNode) -> (u32, u32) {
     }
 }
 
+/// A tmux window layout whose leaves have been paired with an adopted value of
+/// type `T` (e.g. a pane's pre-built manager+view). Mirrors the shape of
+/// [`PaneNodeSnapshot`] but is generic over the leaf payload, so the adoption
+/// path can carry live handles a serializable snapshot cannot.
+#[derive(Debug)]
+pub enum TmuxPaneTree<T> {
+    Leaf(T),
+    Branch {
+        direction: SplitDirection,
+        children: Vec<(PaneFlex, TmuxPaneTree<T>)>,
+    },
+}
+
+/// Generic sibling of [`map_window`]: build a [`TmuxPaneTree`] whose leaves are
+/// produced by `make_leaf`, carrying the same split-direction and flex mapping.
+///
+/// `make_leaf` is `FnMut` (unlike [`map_window`]'s `Fn`) so a caller may create
+/// one pane manager per leaf — a side-effecting op that mutates the app context.
+/// It is invoked in tmux's left-to-right, depth-first pane order.
+pub fn map_window_to<T>(window: &Window, make_leaf: &mut impl FnMut(u32) -> T) -> TmuxPaneTree<T> {
+    map_node_to(&window.root, make_leaf)
+}
+
+fn map_node_to<T>(node: &LayoutNode, make_leaf: &mut impl FnMut(u32) -> T) -> TmuxPaneTree<T> {
+    match node {
+        LayoutNode::Leaf { pane, .. } => TmuxPaneTree::Leaf(make_leaf(*pane)),
+        LayoutNode::Split { dir, children, .. } => {
+            let mut mapped = Vec::with_capacity(children.len());
+            for child in children {
+                let flex = child_flex(child, *dir);
+                mapped.push((flex, map_node_to(child, make_leaf)));
+            }
+            TmuxPaneTree::Branch {
+                direction: map_split_direction(*dir),
+                children: mapped,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "layout_map_tests.rs"]
 mod tests;
