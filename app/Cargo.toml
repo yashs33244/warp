@@ -815,6 +815,10 @@ oz_changelog_updates = []
 personal_cloud_objects = []
 # Remote-backed tty that connects to a PTY-like interface via a server.
 remote_tty = []
+# tmux control-mode (`tmux -CC`) integration. Enables the runtime
+# `FeatureFlag::TmuxControlMode` at startup so the plumbing in
+# `terminal::tmux_tty` is activated.
+tmux_control_mode = []
 # Fix for cursor reflow bug during window resize, from Alacritty resizing logic.
 resize_fix = []
 pluggable_notifications = []
