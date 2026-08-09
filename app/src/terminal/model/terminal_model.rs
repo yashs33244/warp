@@ -2662,6 +2662,16 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn set_title(&mut self, title: Option<String>) {
+        // An adopted tmux pane's shell keeps rewriting its own xterm title to the
+        // running command (a common shell/tmux default), which would relabel the
+        // pane and tab after every command. A normal Warp pane does not chase
+        // commands like this, so ignore the xterm title for adopted panes and let
+        // the name fall back to a stable value (the working-directory chip is a
+        // separate path and still updates).
+        if self.is_adopted_pane {
+            return;
+        }
+
         // Don't set the tab title if the title event is for a running in-band command.
         if self.block_list().is_writing_or_executing_in_band_command() {
             return;

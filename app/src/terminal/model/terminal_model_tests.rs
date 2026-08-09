@@ -2288,6 +2288,22 @@ fn adopted_pane_rewarpify_signal_fires_at_most_once() {
     }
 }
 
+// An adopted tmux pane must not relabel itself after the running command: the
+// shell's xterm-title escape (which many shells set to the current command) is
+// ignored so the pane/tab name stays stable, like a normal Warp pane.
+#[test]
+fn adopted_pane_ignores_xterm_title() {
+    let mut adopted = TerminalModel::mock(None, None);
+    adopted.set_adopted_pane();
+    adopted.set_title(Some("ls -la".to_string()));
+    assert_eq!(adopted.terminal_title(), None);
+
+    // A pane Warp owns still honors the xterm title.
+    let mut owned = TerminalModel::mock(None, None);
+    owned.set_title(Some("vim".to_string()));
+    assert_eq!(owned.terminal_title().as_deref(), Some("vim"));
+}
+
 // Guard (non-regression) tests: these assert the pre-existing arming conditions,
 // distinct from the one-attempt cap proven above.
 // A non-Precmd hook, or a hook on a pane Warp owns, must never arm rewarpify.
