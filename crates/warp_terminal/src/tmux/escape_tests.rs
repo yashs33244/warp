@@ -4,7 +4,7 @@ use super::*;
 fn escape_rules_per_byte() {
     for b in 0u16..=255 {
         let b = b as u8;
-        let e = escape(&[b]);
+        let e = Escaper::escape(&[b]);
         if b < 0x20 || b == b'\\' {
             assert_eq!(e.len(), 4, "byte {b:#04x} should escape to 4 bytes");
             assert_eq!(e[0], b'\\');
@@ -21,7 +21,11 @@ fn roundtrip_every_single_byte() {
     for b in 0u16..=255 {
         let b = b as u8;
         let raw = vec![b];
-        assert_eq!(unescape(&escape(&raw)), raw, "roundtrip byte {b:#04x}");
+        assert_eq!(
+            Escaper::unescape(&Escaper::escape(&raw)),
+            raw,
+            "roundtrip byte {b:#04x}"
+        );
     }
 }
 
@@ -30,7 +34,7 @@ fn roundtrip_every_pair() {
     for a in 0u16..=255 {
         for c in 0u16..=255 {
             let raw = vec![a as u8, c as u8];
-            assert_eq!(unescape(&escape(&raw)), raw);
+            assert_eq!(Escaper::unescape(&Escaper::escape(&raw)), raw);
         }
     }
 }
@@ -54,59 +58,63 @@ fn roundtrip_special_sequences() {
         vec![0xFF; 100],
     ];
     for raw in cases {
-        assert_eq!(unescape(&escape(&raw)), raw, "roundtrip failed");
+        assert_eq!(
+            Escaper::unescape(&Escaper::escape(&raw)),
+            raw,
+            "roundtrip failed"
+        );
     }
 }
 
 #[test]
 fn decode_specific_values() {
-    assert_eq!(unescape(b"\\012"), vec![0x0A]);
-    assert_eq!(unescape(b"\\033"), vec![0x1B]);
-    assert_eq!(unescape(b"\\134"), vec![0x5C]);
-    assert_eq!(unescape(b"\\000"), vec![0x00]);
-    assert_eq!(unescape(b"\\377"), vec![0xFF]);
+    assert_eq!(Escaper::unescape(b"\\012"), vec![0x0A]);
+    assert_eq!(Escaper::unescape(b"\\033"), vec![0x1B]);
+    assert_eq!(Escaper::unescape(b"\\134"), vec![0x5C]);
+    assert_eq!(Escaper::unescape(b"\\000"), vec![0x00]);
+    assert_eq!(Escaper::unescape(b"\\377"), vec![0xFF]);
 }
 
 #[test]
 fn high_bytes_pass_through() {
-    assert_eq!(unescape(&[0x80]), vec![0x80]);
-    assert_eq!(unescape(&[0xFF]), vec![0xFF]);
-    assert_eq!(escape(&[0x80]), vec![0x80]);
-    assert_eq!(escape(&[0xFF]), vec![0xFF]);
+    assert_eq!(Escaper::unescape(&[0x80]), vec![0x80]);
+    assert_eq!(Escaper::unescape(&[0xFF]), vec![0xFF]);
+    assert_eq!(Escaper::escape(&[0x80]), vec![0x80]);
+    assert_eq!(Escaper::escape(&[0xFF]), vec![0xFF]);
 }
 
 #[test]
 fn out_of_range_octal_is_literal() {
     // \400 = 256 decimal, out of u8 range -> literal
-    assert_eq!(unescape(b"\\400"), b"\\400".to_vec());
-    assert_eq!(unescape(b"\\777"), b"\\777".to_vec());
+    assert_eq!(Escaper::unescape(b"\\400"), b"\\400".to_vec());
+    assert_eq!(Escaper::unescape(b"\\777"), b"\\777".to_vec());
 }
 
 #[test]
 fn truncated_and_malformed_no_panic() {
     // lone trailing backslash
-    assert_eq!(unescape(b"\\"), b"\\".to_vec());
+    assert_eq!(Escaper::unescape(b"\\"), b"\\".to_vec());
     // 2 octal digits only
-    assert_eq!(unescape(b"\\01"), b"\\01".to_vec());
+    assert_eq!(Escaper::unescape(b"\\01"), b"\\01".to_vec());
     // 1 octal digit
-    assert_eq!(unescape(b"\\0"), b"\\0".to_vec());
+    assert_eq!(Escaper::unescape(b"\\0"), b"\\0".to_vec());
     // backslash then non-octal
-    assert_eq!(unescape(b"\\099"), b"\\099".to_vec());
-    assert_eq!(unescape(b"\\8"), b"\\8".to_vec());
-    assert_eq!(unescape(b"\\9ab"), b"\\9ab".to_vec());
+    assert_eq!(Escaper::unescape(b"\\099"), b"\\099".to_vec());
+    assert_eq!(Escaper::unescape(b"\\8"), b"\\8".to_vec());
+    assert_eq!(Escaper::unescape(b"\\9ab"), b"\\9ab".to_vec());
     // backslash at very end after content
-    assert_eq!(unescape(b"abc\\"), b"abc\\".to_vec());
+    assert_eq!(Escaper::unescape(b"abc\\"), b"abc\\".to_vec());
     // backslash-backslash (only 2 chars, needs 3 digits) -> literal
-    assert_eq!(unescape(b"\\\\"), b"\\\\".to_vec());
+    assert_eq!(Escaper::unescape(b"\\\\"), b"\\\\".to_vec());
 }
 
 #[test]
 fn escaped_backslash_literal_in_stream() {
     // \134 is backslash; ensure a following \134 decodes independently
-    assert_eq!(unescape(b"\\134\\134"), vec![0x5C, 0x5C]);
+    assert_eq!(Escaper::unescape(b"\\134\\134"), vec![0x5C, 0x5C]);
     // bytes: '\','\','0','1','2'. i=0: window is '\','0','1' -> '\' not
     // octal -> literal '\'. Then "\\012" (i=1) -> 0x0A.
-    assert_eq!(unescape(b"\\\\012"), vec![b'\\', 0x0A]);
+    assert_eq!(Escaper::unescape(b"\\\\012"), vec![b'\\', 0x0A]);
 }
 
 #[test]
@@ -115,7 +123,7 @@ fn no_panic_on_arbitrary_backslash_positions() {
     for a in 0u16..=255 {
         for b in 0u16..=255 {
             let input = [b'\\', a as u8, b as u8];
-            let out = unescape(&input);
+            let out = Escaper::unescape(&input);
             assert_eq!(out, input.to_vec());
         }
     }
@@ -124,7 +132,7 @@ fn no_panic_on_arbitrary_backslash_positions() {
         for d1 in b'0'..=b'9' {
             for d2 in b'0'..=b'9' {
                 let input = [b'\\', d0, d1, d2];
-                let _ = unescape(&input);
+                let _ = Escaper::unescape(&input);
             }
         }
     }
@@ -133,7 +141,7 @@ fn no_panic_on_arbitrary_backslash_positions() {
 #[test]
 fn escape_output_only_uses_octal_digits() {
     for b in 0u16..=255 {
-        let e = escape(&[b as u8]);
+        let e = Escaper::escape(&[b as u8]);
         if e.len() == 4 {
             assert_eq!(e[0], b'\\');
             for &d in &e[1..] {
@@ -155,7 +163,7 @@ fn adv_all_out_of_range_octals_literal() {
         let d2 = b'0' + (v & 7) as u8;
         let input = [b'\\', d0, d1, d2];
         assert_eq!(
-            unescape(&input),
+            Escaper::unescape(&input),
             input.to_vec(),
             "value {v} (\\{d0}{d1}{d2} as chars) must stay literal"
         );
@@ -170,7 +178,7 @@ fn adv_all_in_range_octals_decode() {
         let d1 = b'0' + ((v >> 3) & 7) as u8;
         let d2 = b'0' + (v & 7) as u8;
         let input = [b'\\', d0, d1, d2];
-        assert_eq!(unescape(&input), vec![v as u8], "\\{d0}{d1}{d2}");
+        assert_eq!(Escaper::unescape(&input), vec![v as u8], "\\{d0}{d1}{d2}");
     }
 }
 
@@ -180,40 +188,40 @@ fn adv_all_in_range_octals_decode() {
 fn adv_no_panic_short_windows_exhaustive() {
     for a in 0u16..=255 {
         let one = [b'\\', a as u8];
-        assert_eq!(unescape(&one), one.to_vec());
+        assert_eq!(Escaper::unescape(&one), one.to_vec());
         for b in 0u16..=255 {
             let two = [b'\\', a as u8, b as u8];
-            assert_eq!(unescape(&two), two.to_vec());
+            assert_eq!(Escaper::unescape(&two), two.to_vec());
         }
     }
-    assert_eq!(unescape(b"\\"), b"\\".to_vec());
-    assert_eq!(unescape(b""), Vec::<u8>::new());
+    assert_eq!(Escaper::unescape(b"\\"), b"\\".to_vec());
+    assert_eq!(Escaper::unescape(b""), Vec::<u8>::new());
 }
 
 // A valid escape sitting at the very end of the buffer must decode (guards
 // the i+3<n boundary against being off-by-one too strict).
 #[test]
 fn adv_escape_at_buffer_end_decodes() {
-    assert_eq!(unescape(b"\\012"), vec![0x0A]);
-    assert_eq!(unescape(b"x\\012"), vec![b'x', 0x0A]);
-    assert_eq!(unescape(b"xy\\377"), vec![b'x', b'y', 0xFF]);
+    assert_eq!(Escaper::unescape(b"\\012"), vec![0x0A]);
+    assert_eq!(Escaper::unescape(b"x\\012"), vec![b'x', 0x0A]);
+    assert_eq!(Escaper::unescape(b"xy\\377"), vec![b'x', b'y', 0xFF]);
     // exactly 4 bytes, nothing after
-    assert_eq!(unescape(b"\\000"), vec![0x00]);
+    assert_eq!(Escaper::unescape(b"\\000"), vec![0x00]);
 }
 
 // Only 3 digits are consumed; a 4th digit is passed through.
 #[test]
 fn adv_extra_digit_not_consumed() {
-    assert_eq!(unescape(b"\\0000"), vec![0x00, b'0']);
-    assert_eq!(unescape(b"\\1234"), vec![0o123, b'4']);
-    assert_eq!(unescape(b"\\3777"), vec![0xFF, b'7']);
+    assert_eq!(Escaper::unescape(b"\\0000"), vec![0x00, b'0']);
+    assert_eq!(Escaper::unescape(b"\\1234"), vec![0o123, b'4']);
+    assert_eq!(Escaper::unescape(b"\\3777"), vec![0xFF, b'7']);
 }
 
 // Adjacent escapes decode independently, with high/binary bytes interleaved.
 #[test]
 fn adv_dense_adjacent_escapes() {
     assert_eq!(
-        unescape(b"\\000\\377\\134\\012"),
+        Escaper::unescape(b"\\000\\377\\134\\012"),
         vec![0x00, 0xFF, 0x5C, 0x0A]
     );
     // interleaved raw high bytes pass through untouched
@@ -222,7 +230,7 @@ fn adv_dense_adjacent_escapes() {
     input.push(0x80);
     input.push(0xFF);
     input.extend_from_slice(b"\\007");
-    assert_eq!(unescape(&input), vec![0x1B, 0x80, 0xFF, 0x07]);
+    assert_eq!(Escaper::unescape(&input), vec![0x1B, 0x80, 0xFF, 0x07]);
 }
 
 // Odd runs of backslashes: N backslashes then 3 octal digits. The parser
@@ -232,9 +240,9 @@ fn adv_backslash_runs_before_octal() {
     for n_bs in 0u32..8 {
         let mut input = vec![b'\\'; n_bs as usize];
         input.extend_from_slice(b"012");
-        let out = unescape(&input);
+        let out = Escaper::unescape(&input);
         // whatever it is, re-escaping the decode then unescaping is stable
-        let re = unescape(&escape(&out));
+        let re = Escaper::unescape(&Escaper::escape(&out));
         assert_eq!(re, out, "instability for {n_bs} leading backslashes");
     }
 }
@@ -246,7 +254,7 @@ fn adv_large_literal_buffer() {
     for _ in 0..1000 {
         input.extend_from_slice(b"\\777");
     }
-    assert_eq!(unescape(&input), input);
+    assert_eq!(Escaper::unescape(&input), input);
 }
 
 // Deterministic pseudo-random fuzz of the full pipeline and of raw decode.
@@ -264,10 +272,14 @@ fn adv_deterministic_fuzz() {
         let len = (next() % 64) as usize;
         let raw: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
         // full round-trip identity
-        assert_eq!(unescape(&escape(&raw)), raw, "roundtrip fuzz {raw:?}");
+        assert_eq!(
+            Escaper::unescape(&Escaper::escape(&raw)),
+            raw,
+            "roundtrip fuzz {raw:?}"
+        );
         // raw decode of arbitrary bytes must never panic
         let arb: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
-        let _ = unescape(&arb);
+        let _ = Escaper::unescape(&arb);
     }
 }
 
@@ -276,7 +288,7 @@ fn adv_deterministic_fuzz() {
 #[test]
 fn adv_escape_is_unambiguous() {
     let all: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
-    let enc = escape(&all);
+    let enc = Escaper::escape(&all);
     let mut i = 0;
     while i < enc.len() {
         if enc[i] == b'\\' {
@@ -302,5 +314,5 @@ fn adv_big_mixed_roundtrip() {
             raw.push(b as u8);
         }
     }
-    assert_eq!(unescape(&escape(&raw)), raw);
+    assert_eq!(Escaper::unescape(&Escaper::escape(&raw)), raw);
 }

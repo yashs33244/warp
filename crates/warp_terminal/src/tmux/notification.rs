@@ -232,7 +232,7 @@ pub fn parse_line(line: &[u8]) -> TmuxEvent {
             };
             TmuxEvent::Output {
                 pane,
-                data: super::escape::unescape(data.unwrap_or(b"")),
+                data: super::escape::Escaper::unescape(data.unwrap_or(b"")),
             }
         }
 
@@ -261,7 +261,7 @@ pub fn parse_line(line: &[u8]) -> TmuxEvent {
             TmuxEvent::ExtendedOutput {
                 pane,
                 age,
-                data: super::escape::unescape(&rem[sep + 3..]),
+                data: super::escape::Escaper::unescape(&rem[sep + 3..]),
             }
         }
 
