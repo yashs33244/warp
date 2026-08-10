@@ -53,8 +53,11 @@ fn fixed(cmd: String) -> Vec<u8> {
     }
 }
 
-/// The ONLY input path. Each byte is emitted as two lowercase hex digits, so
-/// no byte (including `0x0a`) can ever appear literally in the payload.
+/// Byte-wise input path: each byte is emitted as two lowercase hex digits, so
+/// no byte (including `0x0a`) can ever appear literally in the payload. Use this
+/// only for input that is already a stream of ASCII/raw bytes (e.g. the
+/// emulator's own DSR/DA query replies); user text goes through
+/// [`send_keys_codepoints`], which is UTF-8 aware.
 pub fn send_keys_hex(pane: u32, bytes: &[u8]) -> Result<Vec<u8>, CommandError> {
     if bytes.is_empty() {
         return Err(CommandError);
@@ -63,6 +66,25 @@ pub fn send_keys_hex(pane: u32, bytes: &[u8]) -> Result<Vec<u8>, CommandError> {
     for b in bytes {
         // Infallible write into a String.
         let _ = write!(cmd, " {b:02x}");
+    }
+    write_command(&cmd)
+}
+
+/// Input path for keys already decoded to Unicode code points. `send-keys -H`
+/// interprets each hex value as a *key* (a code point), not a UTF-8 byte, so a
+/// multi-byte character must be sent as its code point (`é` -> `e9`, an emoji ->
+/// `1f600`); hex-encoding its raw UTF-8 bytes instead would deliver several
+/// wrong characters. Each value is at least two hex digits, so a run of ASCII
+/// keys is byte-identical to [`send_keys_hex`]. Still pure hex, so no key can
+/// smuggle a literal newline onto the control stream.
+pub fn send_keys_codepoints(pane: u32, keys: &[u32]) -> Result<Vec<u8>, CommandError> {
+    if keys.is_empty() {
+        return Err(CommandError);
+    }
+    let mut cmd = format!("send-keys -t %{pane} -H");
+    for key in keys {
+        // Infallible write into a String.
+        let _ = write!(cmd, " {key:02x}");
     }
     write_command(&cmd)
 }

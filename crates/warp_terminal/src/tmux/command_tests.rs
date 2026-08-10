@@ -99,6 +99,21 @@ fn send_keys_hex_single_byte_pane_edges() {
 }
 
 #[test]
+fn send_keys_codepoints_hexes_each_key() {
+    // A run of ASCII keys is byte-identical to the byte form.
+    assert_eq!(
+        send_keys_codepoints(7, &[0x1b, 0x5b, 0x41]).unwrap(),
+        b"send-keys -t %7 -H 1b 5b 41\n"
+    );
+    // A multi-byte code point is one key, not its UTF-8 bytes.
+    assert_eq!(
+        send_keys_codepoints(7, &[0xe9, 0x1f600]).unwrap(),
+        b"send-keys -t %7 -H e9 1f600\n".to_vec()
+    );
+    assert_eq!(send_keys_codepoints(0, &[]), Err(CommandError));
+}
+
+#[test]
 fn resize_pane_format() {
     assert_eq!(resize_pane(1, 80, 24), b"resize-pane -t %1 -x 80 -y 24\n");
 }

@@ -30,6 +30,19 @@ fn input_bytes_become_send_keys_hex() {
 }
 
 #[test]
+fn multibyte_input_is_sent_as_code_points_not_utf8_bytes() {
+    let (sender, rx) = sender();
+    // "é" is U+00E9 (UTF-8 c3 a9) and "😀" is U+1F600 (UTF-8 f0 9f 98 80). Each
+    // must reach tmux as its code point, not as its raw bytes, or `send-keys -H`
+    // delivers several wrong characters.
+    sender
+        .send(Message::Input(Cow::Borrowed("é😀".as_bytes())))
+        .expect("send succeeds");
+    let sent = rx.try_recv().expect("one command queued");
+    assert_eq!(sent, b"send-keys -t %7 -H e9 1f600\n".to_vec());
+}
+
+#[test]
 fn resize_becomes_refresh_client_size() {
     let (sender, rx) = sender();
     let size = SizeInfo::new_without_font_metrics(24, 80);

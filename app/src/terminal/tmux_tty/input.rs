@@ -10,10 +10,11 @@ use super::geometry::TmuxGeometry;
 use crate::terminal::writeable_pty::Message;
 use crate::terminal::writeable_pty::pty_controller::{EventLoopSendError, EventLoopSender};
 
-/// Payload bytes per `send-keys`. tmux rejects an over-long command outright
-/// (empirically somewhere past 4 KB of hex on 3.5a), and each byte costs three
-/// characters of hex, so 1 KiB per command stays comfortably inside the limit.
-const MAX_SEND_KEYS_BYTES: usize = 1024;
+/// Keys per `send-keys`. tmux rejects an over-long command outright
+/// (empirically somewhere past 4 KB of hex on 3.5a), and each key costs up to
+/// seven characters of hex, so 512 keys per command stays comfortably inside
+/// the limit.
+const MAX_SEND_KEYS_KEYS: usize = 512;
 
 /// Bounds on a grid we will ask tmux for, so a degenerate pixel size cannot turn
 /// into an absurd window.
@@ -51,12 +52,14 @@ impl TmuxInputSender {
         match message {
             // Every keystroke goes through `send-keys -H` (hex), the only input
             // path that can never inject a literal newline into the payload.
-            // Split into chunks: tmux rejects an over-long command outright, and
-            // a payload like Warp's shell-bootstrap script is far past the
-            // limit, so sending it whole would silently type nothing.
-            Message::Input(bytes) => bytes
-                .chunks(MAX_SEND_KEYS_BYTES)
-                .filter_map(|chunk| command::send_keys_hex(self.pane, chunk).ok())
+            // Decode to Unicode code points first: `-H` takes key values, not
+            // UTF-8 bytes, so a multi-byte character has to be sent as one key
+            // or it arrives as several wrong characters. Chunk by key (never
+            // mid-character) so a large paste is split without corrupting one,
+            // since tmux rejects an over-long command outright.
+            Message::Input(bytes) => decode_keys(&bytes)
+                .chunks(MAX_SEND_KEYS_KEYS)
+                .filter_map(|chunk| command::send_keys_codepoints(self.pane, chunk).ok())
                 .collect(),
             Message::Resize(size) => self
                 .resize_command(size.columns() as u32, size.rows() as u32)
@@ -91,6 +94,45 @@ impl TmuxInputSender {
             .should_send(self.window, win_cols, win_rows)
             .then(|| command::refresh_client_window_size(self.window, win_cols, win_rows))
     }
+}
+
+/// Decode terminal input bytes into key values (Unicode code points). Valid
+/// UTF-8 yields one key per character, so multi-byte input reaches tmux intact;
+/// a byte that is not valid UTF-8 is forwarded as its own value rather than
+/// dropped, so a raw or partial sequence still gets through.
+fn decode_keys(bytes: &[u8]) -> Vec<u32> {
+    let mut keys = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                keys.extend(text.chars().map(u32::from));
+                break;
+            }
+            Err(err) => {
+                let valid = err.valid_up_to();
+                if valid > 0 {
+                    let text = std::str::from_utf8(&rest[..valid]).expect("valid prefix");
+                    keys.extend(text.chars().map(u32::from));
+                }
+                match err.error_len() {
+                    // A malformed sequence of known length: forward its bytes
+                    // raw, then resume decoding after them.
+                    Some(bad) => {
+                        keys.extend(rest[valid..valid + bad].iter().map(|&b| u32::from(b)));
+                        rest = &rest[valid + bad..];
+                    }
+                    // An incomplete trailing sequence: forward its bytes raw and
+                    // stop (there is nothing after it to decode).
+                    None => {
+                        keys.extend(rest[valid..].iter().map(|&b| u32::from(b)));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    keys
 }
 
 /// `value * numerator / denominator`, rounded to the nearest cell. Widened to
