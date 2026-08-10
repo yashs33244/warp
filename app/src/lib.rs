@@ -1338,6 +1338,9 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
             FeatureFlag::UseTantivySearch.set_enabled(true);
         }
 
+        #[cfg(feature = "tmux_control_mode")]
+        FeatureFlag::TmuxControlMode.set_enabled(true);
+
         // The TUI front-end reuses the full `initialize_app` bootstrap above (so
         // auth, `Appearance`, settings, etc. exist), then runs the device-login
         // flow and mounts the TUI (via `crate::tui::init`) instead of the

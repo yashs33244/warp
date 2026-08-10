@@ -942,6 +942,10 @@ pub enum FeatureFlag {
     /// between credits and dollars. When disabled (prod/stable), the footer
     /// falls back to a static, non-interactive credits total.
     TuiCostTransparency,
+
+    /// Gates the tmux control-mode (`tmux -CC`) integration: rendering tmux
+    /// panes as native Warp panes over the control protocol.
+    TmuxControlMode,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
