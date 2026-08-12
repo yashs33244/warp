@@ -176,6 +176,13 @@ pub fn select_pane(pane: u32) -> Vec<u8> {
     fixed(format!("select-pane -t %{pane}"))
 }
 
+/// Make `window` this client's current window. Selecting it is what makes tmux
+/// size the window to this client and prompt a full-screen app in it to repaint,
+/// so switching to the tab shows correct content instead of a stale/garbled one.
+pub fn select_window(window: u32) -> Vec<u8> {
+    fixed(format!("select-window -t @{window}"))
+}
+
 pub fn kill_session() -> Vec<u8> {
     fixed("kill-session".to_string())
 }

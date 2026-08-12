@@ -923,7 +923,16 @@ fn handle_terminal_view_event(
                 group.close_pane(pane_id, ctx);
             }
             Event::CloseRequested => {
-                group.close_pane_with_confirmation(pane_id, ctx);
+                // A tmux-adopted pane is owned by tmux: kill it there and let
+                // the control-stream notification remove the Warp pane, exactly
+                // like splits. Closing it only locally would leave the pane
+                // alive in the tmux session.
+                let killed_in_tmux = group
+                    .terminal_view_from_pane_id(terminal_pane_id, ctx)
+                    .is_some_and(|view| view.as_ref(ctx).kill_adopted_tmux_pane());
+                if !killed_in_tmux {
+                    group.close_pane_with_confirmation(pane_id, ctx);
+                }
             }
             Event::Pane(pane_event) => group.handle_pane_event(pane_id, pane_event, ctx),
             Event::BlockListCleared => {

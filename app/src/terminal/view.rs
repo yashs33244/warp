@@ -9243,6 +9243,21 @@ impl TerminalView {
 
     /// Mark this view as an adopted tmux pane and give it the commands its
     /// context menu issues against that pane's window.
+    /// If this pane was adopted from tmux, tell tmux to kill it and report that
+    /// we did. tmux then removes the Warp pane over the control stream
+    /// (`%layout-change` / `%window-close`), the same way splits are driven, so
+    /// the caller must NOT also close it locally or the pane would be dropped
+    /// from Warp while surviving in the tmux session.
+    pub(crate) fn kill_adopted_tmux_pane(&self) -> bool {
+        match &self.tmux {
+            Some(tmux) => {
+                tmux.kill_pane();
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn set_tmux_pane_commands(
         &mut self,
         commands: TmuxPaneCommands,

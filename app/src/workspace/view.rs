@@ -1217,6 +1217,9 @@ pub struct Workspace {
     /// `%layout-change` can split panes in beside their neighbours and close
     /// the ones tmux dropped.
     tmux_panes: HashMap<u32, PaneId>,
+    /// tmux pane id -> its window id, so an activated tab can tell tmux which
+    /// window it is (`select-window`) and a closed window can find its panes.
+    tmux_pane_windows: HashMap<u32, u32>,
     /// Whether a tmux control session is already mirrored in this workspace.
     /// Only one is supported at a time: every adopted pane shares `tmux_panes`,
     /// so a second session's `%exit` would tear down the first's panes.
@@ -3552,6 +3555,7 @@ impl Workspace {
             handoff_environment_creation_modal: None,
             create_auth_secret_modal: None,
             tmux_panes: HashMap::new(),
+            tmux_pane_windows: HashMap::new(),
             tmux_control_active: false,
         };
 
@@ -5354,6 +5358,7 @@ impl Workspace {
 
             self.set_active_tab_index(index, ctx);
             self.focus_active_tab(ctx);
+            self.select_active_tmux_window(index, ctx);
             self.update_window_title(ctx);
         }
     }
@@ -13065,6 +13070,7 @@ impl Workspace {
                 .find_pane_id_for_terminal_view(view_id, ctx)
             {
                 self.tmux_panes.insert(pane, pane_id);
+                self.tmux_pane_windows.insert(pane, window);
             }
         }
 
@@ -13121,11 +13127,13 @@ impl Workspace {
             });
             if let Some(new_pane_id) = new_pane_id {
                 self.tmux_panes.insert(pane, new_pane_id);
+                self.tmux_pane_windows.insert(pane, window);
                 sinks.push((pane, sink));
             }
         }
 
         for pane in &delta.removed {
+            self.tmux_pane_windows.remove(pane);
             let Some(pane_id) = self.tmux_panes.remove(pane) else {
                 continue;
             };
@@ -13254,10 +13262,55 @@ impl Workspace {
     /// output the user can neither drive nor scroll.
     pub(crate) fn close_all_tmux_panes(&mut self, ctx: &mut ViewContext<Self>) {
         self.tmux_control_active = false;
+        self.tmux_pane_windows.clear();
         for (_, pane_id) in std::mem::take(&mut self.tmux_panes) {
             if let Some(pane_group) = self.pane_group_containing(pane_id, ctx) {
                 pane_group.update(ctx, |group, ctx| group.close_pane(pane_id, ctx));
             }
+        }
+    }
+
+    /// Close the tab mirroring a tmux window that tmux itself closed (its last
+    /// pane was killed, or another client closed the window). Removes that
+    /// window's panes; the emptied tab closes with them. A multi-pane window
+    /// instead reports individual `%layout-change` removals, handled elsewhere.
+    pub(crate) fn close_tmux_window(&mut self, window: u32, ctx: &mut ViewContext<Self>) {
+        let panes: Vec<u32> = self
+            .tmux_pane_windows
+            .iter()
+            .filter(|(_, w)| **w == window)
+            .map(|(pane, _)| *pane)
+            .collect();
+        for pane in panes {
+            self.tmux_pane_windows.remove(&pane);
+            if let Some(pane_id) = self.tmux_panes.remove(&pane)
+                && let Some(pane_group) = self.pane_group_containing(pane_id, ctx)
+            {
+                pane_group.update(ctx, |group, ctx| group.close_pane(pane_id, ctx));
+            }
+        }
+    }
+
+    /// When the activated tab mirrors a tmux window, make that window tmux's
+    /// current window for this client. Selecting it is what makes tmux size the
+    /// window to this client and prompt a full-screen app to repaint, so the
+    /// content is correct after switching tabs instead of stale or garbled.
+    fn select_active_tmux_window(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let pane_group = tab.pane_group.clone();
+        let window = self
+            .tmux_panes
+            .iter()
+            .find(|(_, pane_id)| pane_group.as_ref(ctx).has_pane_id(**pane_id))
+            .and_then(|(pane, _)| self.tmux_pane_windows.get(pane).copied());
+        if let Some(window) = window {
+            self.send_to_tmux_panes_in_tab(
+                index,
+                warp_terminal::tmux::command::select_window(window),
+                ctx,
+            );
         }
     }
 

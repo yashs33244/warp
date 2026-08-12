@@ -114,6 +114,11 @@ fn send_keys_codepoints_hexes_each_key() {
 }
 
 #[test]
+fn select_window_format() {
+    assert_eq!(select_window(4), b"select-window -t @4\n");
+}
+
+#[test]
 fn resize_pane_format() {
     assert_eq!(resize_pane(1, 80, 24), b"resize-pane -t %1 -x 80 -y 24\n");
 }

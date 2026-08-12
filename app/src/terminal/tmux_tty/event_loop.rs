@@ -121,7 +121,11 @@ impl TmuxEventLoop {
             }
             LifecycleEffect::WindowClosed { window } => {
                 self.adopted_windows.remove(&window);
-                // TODO(PR5-teardown): remove the adopted tab for this window.
+                if let Some(workspace) = self.workspace.upgrade(ctx) {
+                    workspace.update(ctx, |workspace, ctx| {
+                        workspace.close_tmux_window(window, ctx)
+                    });
+                }
             }
             LifecycleEffect::WindowAdded { .. } => {
                 // tmux announces a new window with `%window-add` but no layout;
