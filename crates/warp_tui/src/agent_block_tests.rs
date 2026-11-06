@@ -15,11 +15,12 @@ use warp::tui_export::{
     AIAgentOutputMessageType, AIAgentText, AIAgentTextSection, AIAgentTodo, AIAgentTodoList,
     AIBlockModel, AIBlockOutputStatus, AIConversationId, AIRequestType, ActiveSession,
     AgentOutputImage, AgentOutputImageLayout, AgentOutputMermaidDiagram, AgentOutputTable,
-    Appearance, AuthStateProvider, BlocklistAIActionModel, FailedOutputPresentation,
-    GetRelevantFilesController, LLMId, MessageId, ModelEventDispatcher, OutputStatusUpdateCallback,
-    ReceivedMessageDisplay, RenderableAIError, RequestCommandOutputResult, ServerOutputId,
-    Sessions, Shared, SummarizationType, TaskId, TerminalModel, TodoOperation, TodoStatus,
-    TuiOnboardingMarker, TuiOnboardingMarkers, UserQueryMode,
+    Appearance, AuthStateProvider, BlocklistAIActionModel, ChatGPTSubscriptionErrorAction,
+    ChatGPTSubscriptionErrorActionKind, FailedOutputPresentation, GetRelevantFilesController,
+    LLMId, MessageId, ModelEventDispatcher, OutputStatusUpdateCallback, ReceivedMessageDisplay,
+    RenderableAIError, RequestCommandOutputResult, ServerOutputId, Sessions, Shared,
+    SummarizationType, TaskId, TerminalModel, TodoOperation, TodoStatus, TuiOnboardingMarker,
+    TuiOnboardingMarkers, UserQueryMode, UserWorkspaces, queue_tui_permission_action,
     register_tui_session_view_test_singletons, should_show_failed_output_usage_notice,
 };
 use warp_core::ui::color::blend::Blend;
@@ -469,6 +470,51 @@ fn out_of_credits_failure_matches_tui_design_and_opens_upgrade() {
         });
 
         assert_eq!(&*opened_urls.borrow(), &[expected_upgrade_url]);
+    });
+}
+
+#[test]
+fn chatgpt_subscription_failure_lists_url_actions_as_text() {
+    App::test((), |app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.read(|ctx| {
+            let presentation = FailedOutputPresentation::ChatGPTSubscription {
+                title: "You've reached your ChatGPT usage limit".to_owned(),
+                message: "Continue with Warp credits to keep going.".to_owned(),
+                actions: vec![
+                    ChatGPTSubscriptionErrorAction {
+                        kind: ChatGPTSubscriptionErrorActionKind::ContinueWithWarpCredits,
+                        label: "Continue with Warp credits".to_owned(),
+                    },
+                    ChatGPTSubscriptionErrorAction {
+                        kind: ChatGPTSubscriptionErrorActionKind::OpenUrl {
+                            url: "https://chatgpt.com/#settings/Usage".to_owned(),
+                        },
+                        label: "Manage usage".to_owned(),
+                    },
+                ],
+            };
+            let mut presenter = TuiPresenter::new();
+            let frame = presenter.present_element(
+                render_failure_section(&presentation, &MouseStateHandle::default(), ctx),
+                TuiRect::new(0, 0, 80, 4),
+                ctx,
+            );
+            assert_eq!(
+                frame
+                    .buffer
+                    .to_lines()
+                    .into_iter()
+                    .map(|line| line.trim_end().to_owned())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "⚠ You've reached your ChatGPT usage limit".to_owned(),
+                    "  Continue with Warp credits to keep going.".to_owned(),
+                    String::new(),
+                    "  Manage usage: https://chatgpt.com/#settings/Usage".to_owned(),
+                ]
+            );
+        });
     });
 }
 
@@ -1200,6 +1246,112 @@ fn ask_user_question_action_registers_a_stateful_child_view() {
     });
 }
 
+#[test]
+fn materializing_an_already_blocked_question_notifies_the_owner() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        let action = ask_user_question_action("ask-1", "Which one?");
+        let action_id = action.id.clone();
+        let conversation_id = AIConversationId::new();
+        let block = test_agent_block(
+            &mut app,
+            FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: AIBlockOutputStatus::Pending,
+            },
+        );
+        let blocking_state_changes = Rc::new(Cell::new(0));
+        let changes_for_subscription = blocking_state_changes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&block, move |_, event, _| match event {
+                TuiAIBlockEvent::BlockingStateChanged => {
+                    changes_for_subscription.set(changes_for_subscription.get() + 1);
+                }
+                TuiAIBlockEvent::LayoutInvalidated
+                | TuiAIBlockEvent::ReplacementGuidanceSubmitted { .. } => {}
+            });
+        });
+        let action_model = block.read(&app, |block, _| block.action_model.clone());
+        action_model.update(&mut app, |model, ctx| {
+            queue_tui_permission_action(model, action.clone(), conversation_id, ctx);
+        });
+        assert_eq!(blocking_state_changes.get(), 0);
+
+        block.update(&mut app, |block, ctx| {
+            block.replace_model(
+                block.conversation_id,
+                Rc::new(FakeAgentBlockModel {
+                    inputs: Vec::new(),
+                    status: complete_output_messages(vec![action_message("message-1", action)]),
+                }),
+            );
+            let action_model = block.action_model.clone();
+            block.sync_action_views(&action_model, ctx);
+        });
+
+        assert_eq!(blocking_state_changes.get(), 1);
+        assert!(block.read(&app, |block, ctx| {
+            let Some(TuiToolCallView::AskQuestion(view)) = block.action_views.get(&action_id)
+            else {
+                return false;
+            };
+            view.as_ref(ctx).is_awaiting_answers(ctx)
+        }));
+    });
+}
+
+#[test]
+fn materializing_an_already_blocked_permission_prompt_notifies_the_owner() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        let action = test_action("generic-1");
+        let action_id = action.id.clone();
+        let conversation_id = AIConversationId::new();
+        let block = test_agent_block(
+            &mut app,
+            FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: AIBlockOutputStatus::Pending,
+            },
+        );
+        let blocking_state_changes = Rc::new(Cell::new(0));
+        let changes_for_subscription = blocking_state_changes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&block, move |_, event, _| match event {
+                TuiAIBlockEvent::BlockingStateChanged => {
+                    changes_for_subscription.set(changes_for_subscription.get() + 1);
+                }
+                TuiAIBlockEvent::LayoutInvalidated
+                | TuiAIBlockEvent::ReplacementGuidanceSubmitted { .. } => {}
+            });
+        });
+        let action_model = block.read(&app, |block, _| block.action_model.clone());
+        action_model.update(&mut app, |model, ctx| {
+            queue_tui_permission_action(model, action.clone(), conversation_id, ctx);
+        });
+        assert_eq!(blocking_state_changes.get(), 0);
+
+        block.update(&mut app, |block, ctx| {
+            block.replace_model(
+                block.conversation_id,
+                Rc::new(FakeAgentBlockModel {
+                    inputs: Vec::new(),
+                    status: complete_output_messages(vec![action_message("message-1", action)]),
+                }),
+            );
+            let action_model = block.action_model.clone();
+            block.sync_action_views(&action_model, ctx);
+        });
+
+        assert_eq!(blocking_state_changes.get(), 1);
+        assert!(block.read(&app, |block, ctx| {
+            let Some(TuiToolCallView::Generic(view)) = block.action_views.get(&action_id) else {
+                return false;
+            };
+            view.as_ref(ctx).active_permission_prompt(ctx).is_some()
+        }));
+    });
+}
 #[test]
 fn streamed_ask_user_question_payload_replaces_the_initial_empty_child_view() {
     App::test((), |mut app| async move {
@@ -2303,6 +2455,7 @@ fn test_agent_block_with_registered_singletons(
             &model_events,
             get_relevant_files,
             EntityId::new(),
+            UserWorkspaces::teamless_context_resolver_for_test(),
             ctx,
         )
     });
@@ -2770,5 +2923,6 @@ fn query_input(query: &str) -> AIAgentInput {
         user_query_mode: UserQueryMode::default(),
         running_command: None,
         intended_agent: None,
+        base: None,
     }
 }

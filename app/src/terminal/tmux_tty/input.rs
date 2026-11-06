@@ -33,7 +33,7 @@ impl TmuxInputSender {
                 size.columns() as u32,
                 size.rows() as u32,
             )),
-            Message::Shutdown | Message::ChildExited => None,
+            Message::Shutdown | Message::ShutdownForReplacement | Message::ChildExited => None,
         }
     }
 }
