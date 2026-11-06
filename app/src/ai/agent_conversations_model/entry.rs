@@ -13,10 +13,12 @@ use crate::ai::active_agent_views_model::{ActiveAgentViewsModel, ConversationOrT
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::{
-    AgentSource, AmbientAgentTask, AmbientAgentTaskId, ExecutionLocation,
+    AgentSource, AmbientAgentLiveSessionState, AmbientAgentTask, AmbientAgentTaskId,
+    ExecutionLocation,
 };
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::history_model::{AIConversationMetadata, BlocklistAIHistoryModel};
+use crate::ai::blocklist::orchestration_topology::orchestration_aware_conversation_status;
 use crate::ai::conversation_navigation::ConversationNavigationData;
 use crate::auth::{AuthStateProvider, UserUid};
 use crate::util::time_format::human_readable_precise_duration;
@@ -99,6 +101,7 @@ pub struct AgentConversationDisplayData {
     pub creator: AgentConversationPrincipal,
     pub executor: Option<AgentConversationPrincipal>,
     pub request_usage: Option<f32>,
+    pub cost_in_cents: Option<f32>,
     pub run_time: Option<String>,
     pub session_status: Option<SessionStatus>,
     pub source: Option<AgentSource>,
@@ -388,7 +391,13 @@ fn conversation_display_status(
 ) -> AgentRunDisplayStatus {
     history_model
         .conversation(&metadata.nav_data.id)
-        .map(|conversation| AgentRunDisplayStatus::from_conversation_status(conversation.status()))
+        .map(|conversation| {
+            // Roll the whole orchestration subtree (children, grandchildren,
+            // …) into the card's status.
+            AgentRunDisplayStatus::from_conversation_status(
+                &orchestration_aware_conversation_status(history_model, conversation),
+            )
+        })
         .unwrap_or(AgentRunDisplayStatus::ConversationSucceeded)
 }
 
@@ -406,6 +415,20 @@ fn conversation_request_usage(
         })
 }
 
+fn conversation_cost_in_cents(
+    metadata: &ConversationMetadata,
+    history_model: &BlocklistAIHistoryModel,
+) -> Option<f32> {
+    history_model
+        .conversation(&metadata.nav_data.id)
+        .and_then(|conversation| conversation.usage_totals().total_cost_in_cents())
+        .or_else(|| {
+            history_model
+                .get_conversation_metadata(&metadata.nav_data.id)
+                .and_then(|metadata| metadata.server_conversation_metadata.as_ref())
+                .and_then(|metadata| metadata.usage.billed_cost_in_cents())
+        })
+}
 fn conversation_artifacts(
     metadata: &ConversationMetadata,
     history_model: &BlocklistAIHistoryModel,
@@ -479,15 +502,15 @@ pub(super) fn entry_for_task(
             })
         });
     let status = AgentRunDisplayStatus::from_task(task, app);
-    let has_active_session_id = task
-        .active_execution_session_id()
-        .and_then(parse_session_id)
-        .is_some();
+    let has_attachable_live_session = matches!(
+        task.active_live_session_state(),
+        AmbientAgentLiveSessionState::Attachable { .. }
+    );
     let has_open_ambient_session = ActiveAgentViewsModel::as_ref(app)
         .get_terminal_view_id_for_ambient_task(task.task_id)
         .is_some();
     let can_open = has_open_ambient_session
-        || has_active_session_id
+        || has_attachable_live_session
         || local_conversation_id.is_some()
         || server_conversation_token.is_some();
     let can_copy_link = task.has_active_execution()
@@ -527,6 +550,7 @@ pub(super) fn entry_for_task(
                     principal_type: PrincipalType::parse(&executor.creator_type),
                 }),
             request_usage: task.credits_used(),
+            cost_in_cents: task.cost_in_cents(),
             run_time: task_run_time(task),
             session_status: Some(task_session_status(task)),
             source: task.source.clone(),
@@ -635,6 +659,7 @@ fn entry_for_conversation_parts(
             creator: conversation_creator(&metadata, history_model, app),
             executor: None,
             request_usage: conversation_request_usage(&metadata, history_model),
+            cost_in_cents: conversation_cost_in_cents(&metadata, history_model),
             run_time: None,
             session_status: None,
             source: Some(AgentSource::Interactive),

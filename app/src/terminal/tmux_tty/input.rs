@@ -65,7 +65,7 @@ impl TmuxInputSender {
                 .resize_command(size.columns() as u32, size.rows() as u32)
                 .into_iter()
                 .collect(),
-            Message::Shutdown | Message::ChildExited => Vec::new(),
+            Message::Shutdown | Message::ShutdownForReplacement | Message::ChildExited => Vec::new(),
         }
     }
 

@@ -15,8 +15,8 @@ use warpui::event::ModifiersState;
 use warpui::units::Lines;
 
 use super::inline_banner::{
-    AnonymousUserLoginBannerAction, AwsBedrockLoginBannerAction, AwsCliNotInstalledBannerAction,
-    OpenInWarpBannerAction, VimModeBannerAction,
+    AwsBedrockLoginBannerAction, AwsCliNotInstalledBannerAction, OpenInWarpBannerAction,
+    VimModeBannerAction,
 };
 use super::{
     AliasExpansionBannerAction, ContextMenuAction, GridHighlightedLink, InputContextMenuAction,
@@ -189,7 +189,8 @@ pub enum TerminalAction {
     ControlSequence(Vec<u8>),
     RunNativeShellCompletions {
         buffer_text: String,
-        results_tx: async_channel::Sender<Vec<ShellCompletion>>,
+        results_tx:
+            async_channel::Sender<(Vec<ShellCompletion>, Option<warp_completer::meta::Span>)>,
     },
     KeyDown(String),
     TypedCharacters(String),
@@ -361,11 +362,11 @@ pub enum TerminalAction {
         index: usize,
     },
     WriteCodebaseIndex,
+    AttachFile,
     ToggleAutoexecuteMode,
     ToggleQueueNextPrompt,
     CodebaseIndexSpeedbumpBanner(CodebaseIndexSpeedbumpBannerAction),
     AgentModeSetupSpeedbumpBanner(AgentModeSetupSpeedbumpBannerAction),
-    AnonymousUserAISignUpBanner(AnonymousUserLoginBannerAction),
     ResumeConversation,
     ForkConversationFromLastKnownGoodState,
     ToggleAIDocumentPane,
@@ -695,6 +696,7 @@ impl fmt::Debug for TerminalAction {
                 write!(f, "OpenAttachmentLightbox({index:?})")
             }
             WriteCodebaseIndex => write!(f, "PersistCodebaseIndex"),
+            AttachFile => write!(f, "AttachFile"),
             ToggleAutoexecuteMode => write!(f, "ToggleAutoexecuteMode"),
             ToggleQueueNextPrompt => write!(f, "ToggleQueueNextPrompt"),
             CodebaseIndexSpeedbumpBanner(action) => {
@@ -702,9 +704,6 @@ impl fmt::Debug for TerminalAction {
             }
             AgentModeSetupSpeedbumpBanner(action) => {
                 write!(f, "AgentModeSetupSpeedbumpBanner({action:?})")
-            }
-            AnonymousUserAISignUpBanner(action) => {
-                write!(f, "AnonymousUserLoginBanner({action:?})")
             }
             ResumeConversation => write!(f, "ResumeConversation"),
             ForkConversationFromLastKnownGoodState => {
