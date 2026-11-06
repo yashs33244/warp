@@ -19,11 +19,12 @@ use warp::tui_export::{
     AIActionStatus, AIAgentAction, AIAgentActionId, AIAgentActionType, AIAgentExchangeId,
     AIAgentOutputMessageType, AIAgentText, AIAgentTextSection, AIAgentTodo, AIBlockModel,
     AIBlockModelHelper, AIBlockOutputStatus, AIConversationId, AuthStateProvider, BlockId,
-    BlocklistAIActionEvent, BlocklistAIActionModel, BlocklistAIHistoryModel, CancellationReason,
-    FAILED_OUTPUT_USAGE_NOTICE_TEXT, FailedOutputPresentation, MessageId, ModelEvent,
-    ModelEventDispatcher, ReceivedMessageDisplay, RenderableAIError, SummarizationType,
-    TelemetryEvent, TerminalModel, TodoOperation, TodoStatus, TuiOnboardingMarker,
-    TuiOnboardingMarkers, TuiOnboardingMarkersEvent, UserWorkspaces, failed_output_presentation,
+    BlocklistAIActionEvent, BlocklistAIActionModel, BlocklistAIHistoryModel,
+    CHATGPT_CONTINUED_WITH_WARP_CREDITS_TEXT, CancellationReason, FAILED_OUTPUT_USAGE_NOTICE_TEXT,
+    FailedOutputPresentation, MessageId, ModelEvent, ModelEventDispatcher, ReceivedMessageDisplay,
+    RenderableAIError, SummarizationType, TelemetryEvent, TerminalModel, TodoOperation, TodoStatus,
+    TuiOnboardingMarker, TuiOnboardingMarkers, TuiOnboardingMarkersEvent, UserWorkspaces,
+    chatgpt_subscription_message_with_links, failed_output_presentation,
     should_show_failed_output_usage_notice,
 };
 use warpui::SingletonEntity;
@@ -316,6 +317,26 @@ fn render_failure_section(
             (message.clone(), body_style),
         ])
         .finish(),
+        // The TUI cannot dispatch the recovery actions, so only the copy and any links are shown.
+        FailedOutputPresentation::ChatGPTSubscription {
+            title,
+            message,
+            actions,
+        } => TuiText::from_spans([
+            (FAILURE_WARNING_PREFIX.to_owned(), error_style),
+            (title.clone(), error_style.add_modifier(Modifier::BOLD)),
+            ("\n  ".to_owned(), body_style),
+            (
+                chatgpt_subscription_message_with_links(message, actions).replace('\n', "\n  "),
+                body_style,
+            ),
+        ])
+        .finish(),
+        FailedOutputPresentation::ChatGPTSubscriptionContinuedWithWarpCredits => {
+            TuiText::new(CHATGPT_CONTINUED_WITH_WARP_CREDITS_TEXT)
+                .with_style(body_style)
+                .finish()
+        }
     }
 }
 
@@ -344,6 +365,17 @@ fn failure_text(presentation: &FailedOutputPresentation, app: &AppContext) -> St
         }
         FailedOutputPresentation::InvalidApiKey { title, detail } => {
             format!("{title}\n{detail}")
+        }
+        FailedOutputPresentation::ChatGPTSubscription {
+            title,
+            message,
+            actions,
+        } => {
+            let message = chatgpt_subscription_message_with_links(message, actions);
+            format!("{title}\n{message}")
+        }
+        FailedOutputPresentation::ChatGPTSubscriptionContinuedWithWarpCredits => {
+            CHATGPT_CONTINUED_WITH_WARP_CREDITS_TEXT.to_owned()
         }
     }
 }
@@ -508,18 +540,21 @@ impl TuiAIBlock {
             &action_model,
             |me, action_model, event: &BlocklistAIActionEvent, ctx| {
                 if me.renders_action(event.action_id()) {
-                    if matches!(
+                    let materialized_active_blocker = if matches!(
                         event,
                         BlocklistAIActionEvent::ActionBlockedOnUserConfirmation(_)
                     ) {
-                        me.sync_action_views(&action_model, ctx);
-                    }
+                        me.sync_action_views(&action_model, ctx)
+                    } else {
+                        false
+                    };
                     if matches!(
                         event,
                         BlocklistAIActionEvent::ActionBlockedOnUserConfirmation(_)
                             | BlocklistAIActionEvent::ExecutingAction(_)
                             | BlocklistAIActionEvent::FinishedAction { .. }
-                    ) {
+                    ) && !materialized_active_blocker
+                    {
                         ctx.emit(TuiAIBlockEvent::BlockingStateChanged);
                     }
                     me.invalidate_action(event.action_id(), ctx);
@@ -647,7 +682,8 @@ impl TuiAIBlock {
         &mut self,
         action_model: &ModelHandle<BlocklistAIActionModel>,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
+        let mut materialized_active_blocker = false;
         let status = self.block_model.status(ctx);
         let output_streaming = status.is_streaming();
         let mut ask_question_actions = Vec::new();
@@ -726,6 +762,7 @@ impl TuiAIBlock {
             ctx.subscribe_to_view(&view, |me, _, event, ctx| match event {
                 TuiAskQuestionViewEvent::LayoutChanged => me.invalidate_layout(ctx),
             });
+            materialized_active_blocker |= view.as_ref(ctx).is_awaiting_answers(ctx);
             self.action_views
                 .insert(action_id, TuiToolCallView::AskQuestion(view));
             ctx.notify();
@@ -765,6 +802,7 @@ impl TuiAIBlock {
                     });
                 }
             });
+            materialized_active_blocker |= view.as_ref(ctx).active_permission_prompt(ctx).is_some();
             self.action_views
                 .insert(action_id, TuiToolCallView::Generic(view));
             ctx.notify();
@@ -798,6 +836,7 @@ impl TuiAIBlock {
                     });
                 }
             });
+            materialized_active_blocker |= view.as_ref(ctx).active_permission_prompt(ctx).is_some();
             self.action_views
                 .insert(action_id, TuiToolCallView::FileEdits(view));
             ctx.notify();
@@ -856,6 +895,7 @@ impl TuiAIBlock {
                     });
                 }
             });
+            materialized_active_blocker |= view.as_ref(ctx).active_permission_prompt(ctx).is_some();
             self.action_views
                 .insert(action_id, TuiToolCallView::ShellCommand(view));
             ctx.notify();
@@ -924,10 +964,15 @@ impl TuiAIBlock {
                 }
                 TuiOrchestrationBlockEvent::LayoutInvalidated => me.invalidate_layout(ctx),
             });
+            materialized_active_blocker |= view.as_ref(ctx).is_awaiting_confirmation(ctx);
             self.action_views
                 .insert(action_id, TuiToolCallView::OrchestrationBlock(view));
             ctx.notify();
         }
+        if materialized_active_blocker {
+            ctx.emit(TuiAIBlockEvent::BlockingStateChanged);
+        }
+        materialized_active_blocker
     }
 
     /// Cancels a pending or running action as manually cancelled — the
@@ -1257,7 +1302,16 @@ impl TuiAIBlock {
         let AIBlockOutputStatus::Failed { error, .. } = status else {
             return None;
         };
-        failed_output_presentation(error, app).map(|presentation| (error, presentation))
+        let conversation_uses_warp_credits_instead_of_chatgpt = self
+            .block_model
+            .conversation(app)
+            .is_some_and(|conversation| conversation.use_warp_credits_instead_of_chatgpt());
+        failed_output_presentation(
+            error,
+            conversation_uses_warp_credits_instead_of_chatgpt,
+            app,
+        )
+        .map(|presentation| (error, presentation))
     }
 
     pub(super) fn has_out_of_credits_failure(&self, app: &AppContext) -> bool {
